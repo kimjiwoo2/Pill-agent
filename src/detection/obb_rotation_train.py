@@ -41,7 +41,7 @@ CONVENTIONS = [(+1, 0), (+1, 90), (-1, 0), (-1, 90)]
 # ----------------------------------------------------------------------------- config
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["verify", "build", "train", "all"], default="build")
+    p.add_argument("--mode", choices=["verify", "build", "train", "all", "straighten"], default="build")
     p.add_argument("--data-root", type=Path, required=True,
                    help="아래 파일들이 있는 로컬 디렉토리")
     p.add_argument("--rot-train", default="ys_rotation_labels_train_v1.csv")
@@ -61,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--convention", type=int, default=0, choices=range(len(CONVENTIONS)))
     p.add_argument("--box-margin", type=float, default=1.0,
                    help="회전박스 크기 배수 (1.0=bbox 감쌈, >1 여유 더). 절대 안 잘리게 감싸는 방식")
+    # straighten (OCR/분류 학습용: GT 각도로 펴서 저장 + zip)
+    p.add_argument("--straight-out", type=Path, default=None,
+                   help="펴진 crop 저장 위치 (기본 data-root/straightened)")
+    p.add_argument("--straight-pad", type=float, default=0.10, help="crop 여백 비율")
+    p.add_argument("--straight-sign", type=int, default=-1, choices=[-1, 1],
+                   help="회전 부호. straighten_check.png에서 글자가 뒤집혀 나오면 반대로")
 
     # 학습
     p.add_argument("--model", default="yolo11n-obb.pt")
@@ -350,6 +356,103 @@ def cmd_verify(args, work, n_samples=6):
     print("  → 각 열 중 박스가 알약에 '딱' 붙는 열의 번호를 --convention 으로 지정하세요.")
 
 
+# --------------------------------------------------------------------- straighten set
+def straighten_crop(img, cx, cy, bw, bh, deg, sign, pad):
+    """GT 회전각(deg, 360°)으로 알약을 정방향 수평으로 펴서 crop 반환."""
+    import cv2
+    M = cv2.getRotationMatrix2D((float(cx), float(cy)), sign * float(deg), 1.0)
+    rot = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]),
+                         flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    W, H = bw * (1 + pad), bh * (1 + pad)
+    x0, y0 = max(0, int(round(cx - W / 2))), max(0, int(round(cy - H / 2)))
+    x1, y1 = int(round(cx + W / 2)), int(round(cy + H / 2))
+    crop = rot[y0:y1, x0:x1]
+    if crop.size and crop.shape[0] > crop.shape[1]:   # 세로로 길면 가로로 눕히기
+        crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
+    return crop
+
+
+def _viz_straighten(crop_dir, out_path, n=12):
+    import cv2
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    files = sorted(crop_dir.glob("*.png"))
+    if not files:
+        return
+    pick = np.unique(np.linspace(0, len(files) - 1, min(n, len(files))).astype(int))
+    imgs = [(cv2.cvtColor(cv2.imread(str(files[i])), cv2.COLOR_BGR2RGB), files[i].stem)
+            for i in pick]
+    cols = 4
+    rows = (len(imgs) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+    axes = np.array(axes).reshape(-1)
+    for ax, (im, name) in zip(axes, imgs):
+        ax.imshow(im)
+        ax.set_title(name, fontsize=7)
+        ax.axis("off")
+    for ax in axes[len(imgs):]:
+        ax.axis("off")
+    plt.suptitle("straighten check — 각인이 수평·정방향인지 확인", fontsize=11)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=110)
+    plt.close()
+    print(f"  [viz] 저장: {out_path}")
+
+
+def cmd_straighten(args, work):
+    """GT 회전각으로 알약을 정방향으로 펴서 저장 + split별 zip (+ 라벨 manifest).
+    OCR/분류 학습용 데이터. 추론(파이프라인)은 저장 없이 편 crop만 쓰면 됨."""
+    import cv2
+    out_root = args.straight_out or (args.data_root / "straightened")
+    out_root.mkdir(parents=True, exist_ok=True)
+    _, man = load_merged(args, "train")
+    label_cols = ["object_id", "image_file", "split", "print_front", "print_back",
+                  "drug_shape", "color_class1", "color_class2", "dataset_type",
+                  "item_seq", "rotation_label_deg", "rotation_label_quality"]
+    print(f"[straighten] sign={args.straight_sign}, pad={args.straight_pad} → {out_root}")
+    for split in ["train", "val"]:
+        m, _ = load_merged(args, split)
+        df = filter_split(m, man, args.quality, require_complete=not args.allow_incomplete)
+        lut = ensure_images(img_source(args, split), work / "raw" / split)
+        crop_dir = out_root / split
+        shutil.rmtree(crop_dir, ignore_errors=True)
+        crop_dir.mkdir(parents=True, exist_ok=True)
+
+        rows, n_ok, n_miss = [], 0, 0
+        for _, r in df.iterrows():
+            src = lut.get(r["image_file"])
+            img = cv2.imread(str(src)) if src is not None else None
+            if img is None:
+                n_miss += 1
+                continue
+            cx = r["bbox_x"] + r["bbox_w"] / 2
+            cy = r["bbox_y"] + r["bbox_h"] / 2
+            crop = straighten_crop(img, cx, cy, r["bbox_w"], r["bbox_h"],
+                                   r["rotation_label_deg"], args.straight_sign, args.straight_pad)
+            if crop is None or crop.size == 0:
+                n_miss += 1
+                continue
+            cv2.imwrite(str(crop_dir / f"{r['object_id']}.png"), crop)
+            rows.append({c: r.get(c) for c in label_cols if c in df.columns})
+            n_ok += 1
+
+        mani_path = out_root / f"straightened_manifest_{split}.csv"
+        pd.DataFrame(rows).to_csv(mani_path, index=False)
+        zip_path = out_root / f"straightened_{split}.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            for p in crop_dir.glob("*.png"):
+                zf.write(p, arcname=p.name)
+            zf.write(mani_path, arcname=mani_path.name)
+        print(f"  [{split}] 저장 {n_ok:,} / 누락 {n_miss}  → {zip_path.name} "
+              f"({zip_path.stat().st_size / 1e9:.2f} GB)")
+        try:
+            _viz_straighten(crop_dir, out_root / f"straighten_check_{split}.png", args.viz_samples)
+        except Exception as e:
+            print(f"  [viz] straighten check {split} 실패(무시): {e}")
+    print(f"[straighten] 완료 → {out_root}")
+
+
 def cmd_train(args, work):
     from ultralytics import YOLO
     data_yaml = work / "dataset" / "dataset.yaml"
@@ -379,6 +482,8 @@ def main():
         cmd_verify(args, work)
     if args.mode in ("build", "all"):
         cmd_build(args, work)
+    if args.mode in ("straighten",):
+        cmd_straighten(args, work)
     if args.mode in ("train", "all"):
         cmd_train(args, work)
 
