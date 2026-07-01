@@ -358,16 +358,23 @@ def cmd_verify(args, work, n_samples=6):
 
 # --------------------------------------------------------------------- straighten set
 def straighten_crop(img, cx, cy, bw, bh, deg, sign, pad):
-    """GT 회전각(deg, 360°)으로 알약을 정방향 수평으로 펴서 crop 반환."""
+    """GT 회전각(deg, 360°)으로 알약을 정방향 수평으로 펴서 crop 반환.
+    회전 후에도 안 잘리게: 원 bbox 네 모서리를 같은 회전으로 옮겨 그 bounding box를 crop
+    (bbox 폭으로 자르면 기울어진 길쭉한 알약의 길이가 잘리는 문제 방지)."""
     import cv2
     M = cv2.getRotationMatrix2D((float(cx), float(cy)), sign * float(deg), 1.0)
     rot = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]),
                          flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    W, H = bw * (1 + pad), bh * (1 + pad)
-    x0, y0 = max(0, int(round(cx - W / 2))), max(0, int(round(cy - H / 2)))
-    x1, y1 = int(round(cx + W / 2)), int(round(cy + H / 2))
-    crop = rot[y0:y1, x0:x1]
-    if crop.size and crop.shape[0] > crop.shape[1]:   # 세로로 길면 가로로 눕히기
+    corners = np.array([[cx - bw / 2, cy - bh / 2], [cx + bw / 2, cy - bh / 2],
+                        [cx + bw / 2, cy + bh / 2], [cx - bw / 2, cy + bh / 2]], dtype=np.float64)
+    pts = (M[:, :2] @ corners.T + M[:, 2:3]).T          # 회전 프레임 좌표
+    x0, y0 = pts[:, 0].min(), pts[:, 1].min()
+    x1, y1 = pts[:, 0].max(), pts[:, 1].max()
+    px, py = (x1 - x0) * pad / 2, (y1 - y0) * pad / 2
+    X0, Y0 = max(0, int(round(x0 - px))), max(0, int(round(y0 - py)))
+    X1, Y1 = int(round(x1 + px)), int(round(y1 + py))
+    crop = rot[Y0:Y1, X0:X1]
+    if crop.size and crop.shape[0] > crop.shape[1]:     # 세로로 길면 가로로 눕히기
         crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
     return crop
 
