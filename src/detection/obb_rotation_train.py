@@ -70,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="0")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--name", default="yolo11n_obb_v1")
+    p.add_argument("--viz-samples", type=int, default=12, help="sanity 시각화 샘플 수")
     return p.parse_args()
 
 
@@ -171,6 +172,94 @@ def img_source(args, split):
     return args.data_root / (args.img_train if split == "train" else args.img_val)
 
 
+# ------------------------------------------------------------------------- sanity viz
+def _draw_obb_grid(items, out_path, title, n_cols=4):
+    """items: [(image_path, [poly_px,...])] → 격자 저장. poly_px = [(x,y) 4개]."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import cv2
+    items = [it for it in items if it is not None]
+    if not items:
+        print(f"  [viz] {out_path.name}: 샘플 없음, 스킵")
+        return
+    n = len(items)
+    cols = min(n_cols, n)
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+    axes = np.array(axes).reshape(-1)
+    for ax, (img_path, polys) in zip(axes, items):
+        img = cv2.imread(str(img_path))
+        if img is not None:
+            ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            for poly in polys:
+                ax.add_patch(plt.Polygon(poly, closed=True, fill=False,
+                                         edgecolor="lime", linewidth=2))
+        ax.set_xticks([]); ax.set_yticks([])
+    for ax in axes[n:]:
+        ax.axis("off")
+    plt.suptitle(title, fontsize=11)
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=110)
+    plt.close()
+    print(f"  [viz] 저장: {out_path}")
+
+
+def viz_build_check(work, split, n=12):
+    """디스크에 쓴 OBB 라벨(.txt)을 이미지에 겹쳐 확인 → build_check_{split}.png"""
+    import cv2
+    img_dir = work / "dataset" / "images" / split
+    lbl_dir = work / "dataset" / "labels" / split
+    lbls = sorted(lbl_dir.glob("*.txt"))
+    if not lbls:
+        return
+    pick = np.unique(np.linspace(0, len(lbls) - 1, min(n, len(lbls))).astype(int))
+    items = []
+    for i in pick:
+        lp = lbls[i]
+        cand = list(img_dir.glob(lp.stem + ".*"))
+        if not cand:
+            continue
+        img = cv2.imread(str(cand[0]))
+        if img is None:
+            continue
+        H, W = img.shape[:2]
+        polys = []
+        for line in lp.read_text().splitlines():
+            v = line.split()
+            if len(v) < 9:
+                continue
+            xy = list(map(float, v[1:9]))
+            polys.append([(xy[j] * W, xy[j + 1] * H) for j in range(0, 8, 2)])
+        items.append((cand[0], polys))
+    _draw_obb_grid(items, work / f"build_check_{split}.png",
+                   f"build check — {split} (디스크 라벨 → 이미지 오버레이)")
+
+
+def viz_predict_check(model, work, imgsz, n=12):
+    """학습된 모델로 val 이미지 예측 OBB 그려 확인 → predict_check.png"""
+    img_dir = work / "dataset" / "images" / "val"
+    imgs = sorted(p for p in img_dir.iterdir()
+                  if p.suffix.lower() in (".png", ".jpg", ".jpeg"))
+    if not imgs:
+        return
+    idx = np.unique(np.linspace(0, len(imgs) - 1, min(n, len(imgs))).astype(int))
+    pick = [imgs[i] for i in idx]
+    results = model.predict(source=[str(p) for p in pick], imgsz=imgsz,
+                            conf=0.25, verbose=False)
+    items = []
+    for p, r in zip(pick, results):
+        polys = []
+        obb = getattr(r, "obb", None)
+        if obb is not None and getattr(obb, "xyxyxyxy", None) is not None:
+            for poly in obb.xyxyxyxy.cpu().numpy():
+                polys.append([(float(x), float(y)) for x, y in poly])
+        items.append((p, polys))
+    _draw_obb_grid(items, work / "predict_check.png",
+                   "predict check — val (모델 예측 OBB)")
+
+
 # ---------------------------------------------------------------------------- commands
 def cmd_build(args, work):
     sign, offset = CONVENTIONS[args.convention]
@@ -211,6 +300,11 @@ def cmd_build(args, work):
 
     (work / "dataset" / "dataset.yaml").write_text("\n".join(yaml_lines) + "\n")
     print(f"[build] dataset.yaml → {work / 'dataset' / 'dataset.yaml'}")
+    for sp in ["train", "val"]:                      # sanity: 만든 라벨 눈으로 확인
+        try:
+            viz_build_check(work, sp, args.viz_samples)
+        except Exception as e:
+            print(f"  [viz] build check {sp} 실패(무시): {e}")
 
 
 def cmd_verify(args, work, n_samples=6):
@@ -271,6 +365,10 @@ def cmd_train(args, work):
     )
     metrics = model.val()
     print(f"[train] mAP50={metrics.box.map50:.4f}  mAP50-95={metrics.box.map:.4f}")
+    try:                                             # sanity: 예측 결과 눈으로 확인
+        viz_predict_check(model, work, args.imgsz, args.viz_samples)
+    except Exception as e:
+        print(f"  [viz] predict check 실패(무시): {e}")
 
 
 def main():
