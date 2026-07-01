@@ -1,0 +1,294 @@
+"""
+Pill OBB (oriented bbox) 학습 파이프라인 — 연구실 GPU / VSCode-SSH 용.
+
+입력:
+  - 회전각 라벨  : ys_rotation_labels_{train,val}_v1.csv   (object_id, rotation_label_deg, quality, ...)
+  - 좌표 manifest: manifest_clean_20k_33340.csv            (object_id, image_file, bbox_x/y/w/h, width, height)
+  - 원본 이미지  : images_train.zip / images_val.zip        (full image = image_file)
+
+흐름:
+  1) rotation ⨝ manifest (object_id)  → 축정렬 bbox + 각도 결합
+  2) 이미지 단위 필터: 완전라벨(모든 알약 존재) + quality(high[+medium]) + bbox 유효
+  3) 축정렬 bbox + 각도  → 꽉 끼는 회전사각형 복원 → YOLO OBB 4점 폴리곤 라벨
+  4) 각도 회전방향(convention)이 데이터마다 다를 수 있어 4가지를 겹쳐 그려 눈으로 확정
+  5) yolo11n-obb 학습
+
+사용:
+  python obb_rotation_train.py --mode verify   --data-root /data/pill_obb      # 먼저: convention_grid.png 확인
+  python obb_rotation_train.py --mode build    --data-root /data/pill_obb --convention 0
+  python obb_rotation_train.py --mode train    --data-root /data/pill_obb
+  # (verify에서 어느 열이 알약에 딱 붙는지 보고 --convention 0~3 지정)
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import shutil
+import zipfile
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# (sign, offset_deg) — 박스 각도 phi = (sign*rotation_label_deg + offset) % 180
+CONVENTIONS = [(+1, 0), (+1, 90), (-1, 0), (-1, 90)]
+
+
+# ----------------------------------------------------------------------------- config
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["verify", "build", "train", "all"], default="build")
+    p.add_argument("--data-root", type=Path, required=True,
+                   help="아래 파일들이 있는 로컬 디렉토리")
+    p.add_argument("--rot-train", default="ys_rotation_labels_train_v1.csv")
+    p.add_argument("--rot-val",   default="ys_rotation_labels_val_v1.csv")
+    p.add_argument("--manifest",  default="manifest_clean_20k_33340.csv")
+    p.add_argument("--img-train", default="images_train.zip", help="zip 또는 이미 푼 폴더")
+    p.add_argument("--img-val",   default="images_val.zip")
+    p.add_argument("--work-dir",  type=Path, default=None, help="산출물 위치 (기본: data-root/obb_work)")
+
+    # 필터
+    p.add_argument("--quality", nargs="+", default=["high", "medium"],
+                   help="각도 신뢰도 등급 채택 (기본 high+medium; 엄격히 하려면 high)")
+    p.add_argument("--allow-incomplete", action="store_true",
+                   help="한 이미지의 일부 알약만 라벨돼도 사용 (기본: 완전라벨만)")
+
+    # 기하 convention (verify로 정함)
+    p.add_argument("--convention", type=int, default=0, choices=range(len(CONVENTIONS)))
+
+    # 학습
+    p.add_argument("--model", default="yolo11n-obb.pt")
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--imgsz", type=int, default=1024)
+    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--device", default="0")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--name", default="yolo11n_obb_v1")
+    return p.parse_args()
+
+
+# --------------------------------------------------------------------------- data join
+def load_merged(args: argparse.Namespace, split: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rot_path = args.data_root / (args.rot_train if split == "train" else args.rot_val)
+    man = pd.read_csv(args.data_root / args.manifest, low_memory=False)
+    rot = pd.read_csv(rot_path, low_memory=False)
+
+    rot["object_id"] = rot["object_id"].astype(str)
+    man["object_id"] = man["object_id"].astype(str)
+    m = rot.merge(man, on="object_id", how="left", suffixes=("", "_man"))
+    return m, man
+
+
+def filter_split(m: pd.DataFrame, man: pd.DataFrame, quality: list[str],
+                 require_complete: bool) -> pd.DataFrame:
+    need = ["image_file", "bbox_x", "bbox_y", "bbox_w", "bbox_h", "width", "height"]
+    m = m.dropna(subset=need).copy()
+
+    valid_box = (
+        (m["bbox_w"] > 0) & (m["bbox_h"] > 0)
+        & (m["bbox_x"] >= 0) & (m["bbox_y"] >= 0)
+        & (m["bbox_x"] + m["bbox_w"] <= m["width"])
+        & (m["bbox_y"] + m["bbox_h"] <= m["height"])
+    )
+    m = m[valid_box]
+
+    good = m[m["rotation_label_quality"].isin(quality)].copy()
+
+    if require_complete:
+        man_cnt = man.groupby("image_file")["object_id"].nunique()
+        good_cnt = good.groupby("image_file")["object_id"].nunique()
+        keep = good_cnt.index[good_cnt.values >= man_cnt.reindex(good_cnt.index).values]
+        good = good[good["image_file"].isin(keep)]
+
+    return good.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------- geometry
+def reconstruct_rect(bw: float, bh: float, phi_deg: float) -> tuple[float, float]:
+    """축정렬 bbox(bw,bh) + 박스각(phi) → 꽉 끼는 회전사각형의 길이 L, 폭 S.
+    가정: 알약을 회전사각형으로 근사. Wa=L|cos|+S|sin|, Ha=L|sin|+S|cos| 연립.
+    30도 격자라 45도(특이) 안 걸림. 실패 시 축정렬 박스로 폴백."""
+    r = math.radians(phi_deg)
+    c, s = abs(math.cos(r)), abs(math.sin(r))
+    d = c * c - s * s
+    if abs(d) < 1e-6:
+        return bw, bh
+    L = (bw * c - bh * s) / d
+    S = (bh * c - bw * s) / d
+    if L <= 0 or S <= 0:
+        return bw, bh
+    return L, S
+
+
+def obb_corners_px(cx, cy, bw, bh, theta_deg, sign, offset):
+    """이미지 픽셀 좌표(x→우, y→하) 기준 회전사각형 4점."""
+    phi = (sign * theta_deg + offset) % 180
+    L, S = reconstruct_rect(bw, bh, phi)
+    r = math.radians(phi)
+    ux, uy = math.cos(r), math.sin(r)          # length 축
+    vx, vy = -math.sin(r), math.cos(r)         # width 축
+    hl, hs = L / 2, S / 2
+    return [
+        (cx + hl * ux + hs * vx, cy + hl * uy + hs * vy),
+        (cx + hl * ux - hs * vx, cy + hl * uy - hs * vy),
+        (cx - hl * ux - hs * vx, cy - hl * uy - hs * vy),
+        (cx - hl * ux + hs * vx, cy - hl * uy + hs * vy),
+    ]
+
+
+def obb_label_line(row, sign, offset) -> str:
+    cx = row["bbox_x"] + row["bbox_w"] / 2
+    cy = row["bbox_y"] + row["bbox_h"] / 2
+    pts = obb_corners_px(cx, cy, row["bbox_w"], row["bbox_h"],
+                         row["rotation_label_deg"], sign, offset)
+    W, H = row["width"], row["height"]
+    coords = []
+    for x, y in pts:
+        coords.append(min(max(x / W, 0.0), 1.0))
+        coords.append(min(max(y / H, 0.0), 1.0))
+    return "0 " + " ".join(f"{v:.6f}" for v in coords)
+
+
+# ------------------------------------------------------------------------- images / io
+def ensure_images(src: Path, out_dir: Path) -> dict[str, Path]:
+    """zip이면 풀고, 폴더면 그대로 사용. {파일명: 경로} 반환."""
+    if src.is_dir():
+        root = src
+    else:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        marker = out_dir / ".extracted"
+        if not marker.exists():
+            print(f"  압축 해제: {src.name} → {out_dir}")
+            with zipfile.ZipFile(src) as zf:
+                zf.extractall(out_dir)
+            marker.touch()
+        root = out_dir
+    lut = {}
+    for ext in ("*.png", "*.jpg", "*.jpeg"):
+        for p in root.rglob(ext):
+            lut[p.name] = p
+    print(f"  이미지 {len(lut):,}장 인덱싱: {root}")
+    return lut
+
+
+def img_source(args, split):
+    return args.data_root / (args.img_train if split == "train" else args.img_val)
+
+
+# ---------------------------------------------------------------------------- commands
+def cmd_build(args, work):
+    sign, offset = CONVENTIONS[args.convention]
+    print(f"[build] convention={args.convention} (sign={sign}, offset={offset}), "
+          f"quality={args.quality}, complete={'no' if args.allow_incomplete else 'yes'}")
+    _, man = load_merged(args, "train")
+
+    yaml_lines = [f"path: {work / 'dataset'}", "train: images/train", "val: images/val",
+                  "nc: 1", "names: [pill]"]
+    (work / "dataset").mkdir(parents=True, exist_ok=True)
+
+    for split in ["train", "val"]:
+        m, _ = load_merged(args, split)
+        df = filter_split(m, man, args.quality, require_complete=not args.allow_incomplete)
+        lut = ensure_images(img_source(args, split), work / "raw" / split)
+
+        img_dir = work / "dataset" / "images" / split
+        lbl_dir = work / "dataset" / "labels" / split
+        for d in (img_dir, lbl_dir):
+            shutil.rmtree(d, ignore_errors=True)
+            d.mkdir(parents=True, exist_ok=True)
+
+        n_img, n_obj, miss = 0, 0, 0
+        for fname, grp in df.groupby("image_file"):
+            src = lut.get(fname)
+            if src is None:
+                miss += 1
+                continue
+            lines = [obb_label_line(r, sign, offset) for _, r in grp.iterrows()]
+            (lbl_dir / f"{Path(fname).stem}.txt").write_text("\n".join(lines))
+            link = img_dir / fname
+            if not link.exists():
+                os.symlink(src.resolve(), link)
+            n_img += 1
+            n_obj += len(lines)
+        print(f"  [{split}] 이미지 {n_img:,} / 알약 {n_obj:,}  (원본 누락 {miss})")
+
+    (work / "dataset" / "dataset.yaml").write_text("\n".join(yaml_lines) + "\n")
+    print(f"[build] dataset.yaml → {work / 'dataset' / 'dataset.yaml'}")
+
+
+def cmd_verify(args, work, n_samples=6):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import cv2
+
+    _, man = load_merged(args, "val")
+    m, _ = load_merged(args, "val")
+    df = filter_split(m, man, args.quality, require_complete=not args.allow_incomplete)
+    lut = ensure_images(img_source(args, "val"), work / "raw" / "val")
+
+    # 각도가 다양하게 걸리도록 샘플
+    df = df.sort_values("rotation_label_deg")
+    idx = np.linspace(0, len(df) - 1, n_samples).astype(int)
+    samples = df.iloc[idx]
+
+    fig, axes = plt.subplots(n_samples, len(CONVENTIONS),
+                             figsize=(len(CONVENTIONS) * 3, n_samples * 3))
+    for c, (sign, offset) in enumerate(CONVENTIONS):
+        axes[0, c].set_title(f"conv {c}\n(sign={sign}, off={offset})", fontsize=9)
+    for r, (_, row) in enumerate(samples.iterrows()):
+        src = lut.get(row["image_file"])
+        img = cv2.cvtColor(cv2.imread(str(src)), cv2.COLOR_BGR2RGB) if src else None
+        cx = row["bbox_x"] + row["bbox_w"] / 2
+        cy = row["bbox_y"] + row["bbox_h"] / 2
+        for c, (sign, offset) in enumerate(CONVENTIONS):
+            ax = axes[r, c]
+            if img is not None:
+                ax.imshow(img)
+                pts = obb_corners_px(cx, cy, row["bbox_w"], row["bbox_h"],
+                                     row["rotation_label_deg"], sign, offset)
+                poly = plt.Polygon(pts, fill=False, edgecolor="lime", linewidth=2)
+                ax.add_patch(poly)
+            if c == 0:
+                ax.set_ylabel(f"deg={int(row['rotation_label_deg'])}", fontsize=8)
+            ax.set_xticks([]); ax.set_yticks([])
+    out = work / "convention_grid.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout(); plt.savefig(out, dpi=110); plt.close()
+    print(f"[verify] 저장: {out}")
+    print("  → 각 열 중 박스가 알약에 '딱' 붙는 열의 번호를 --convention 으로 지정하세요.")
+
+
+def cmd_train(args, work):
+    from ultralytics import YOLO
+    data_yaml = work / "dataset" / "dataset.yaml"
+    assert data_yaml.exists(), "먼저 --mode build 실행"
+    model = YOLO(args.model)
+    model.train(
+        data=str(data_yaml),
+        epochs=args.epochs, imgsz=args.imgsz, batch=args.batch,
+        device=args.device, workers=args.workers,
+        optimizer="AdamW", lr0=0.002, patience=15,
+        fliplr=0.0, flipud=0.0,          # 방향이 라벨이라 좌우/상하 반전 금지
+        project=str(work / "runs"), name=args.name,
+    )
+    metrics = model.val()
+    print(f"[train] mAP50={metrics.box.map50:.4f}  mAP50-95={metrics.box.map:.4f}")
+
+
+def main():
+    args = parse_args()
+    work = args.work_dir or (args.data_root / "obb_work")
+    work.mkdir(parents=True, exist_ok=True)
+    if args.mode in ("verify",):
+        cmd_verify(args, work)
+    if args.mode in ("build", "all"):
+        cmd_build(args, work)
+    if args.mode in ("train", "all"):
+        cmd_train(args, work)
+
+
+if __name__ == "__main__":
+    main()
