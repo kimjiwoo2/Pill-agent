@@ -81,13 +81,15 @@ def load_merged(args: argparse.Namespace, split: str) -> tuple[pd.DataFrame, pd.
 
     rot["object_id"] = rot["object_id"].astype(str)
     man["object_id"] = man["object_id"].astype(str)
+    man = man.drop_duplicates("object_id", keep="first")   # object_id 1:1 보장 (중복 라벨 방지)
     m = rot.merge(man, on="object_id", how="left", suffixes=("", "_man"))
     return m, man
 
 
 def filter_split(m: pd.DataFrame, man: pd.DataFrame, quality: list[str],
                  require_complete: bool) -> pd.DataFrame:
-    need = ["image_file", "bbox_x", "bbox_y", "bbox_w", "bbox_h", "width", "height"]
+    need = ["image_file", "bbox_x", "bbox_y", "bbox_w", "bbox_h", "width", "height",
+            "rotation_label_deg"]                          # 각도 NaN 행 제거 (라벨에 nan 새는 것 방지)
     m = m.dropna(subset=need).copy()
 
     valid_box = (
