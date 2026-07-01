@@ -9,7 +9,8 @@ Pill OBB (oriented bbox) 학습 파이프라인 — 연구실 GPU / VSCode-SSH �
 흐름:
   1) rotation ⨝ manifest (object_id)  → 축정렬 bbox + 각도 결합
   2) 이미지 단위 필터: 완전라벨(모든 알약 존재) + quality(high[+medium]) + bbox 유효
-  3) 축정렬 bbox + 각도  → 꽉 끼는 회전사각형 복원 → YOLO OBB 4점 폴리곤 라벨
+  3) 축정렬 bbox + 각도  → bbox를 '포함'하는 회전박스(안 잘림) → YOLO OBB 4점 폴리곤 라벨
+     (다운스트림에서 한 번 더 tight crop 전제라 '자르지 않고 감싸기'만 하면 됨)
   4) 각도 회전방향(convention)이 데이터마다 다를 수 있어 4가지를 겹쳐 그려 눈으로 확정
   5) yolo11n-obb 학습
 
@@ -18,6 +19,7 @@ Pill OBB (oriented bbox) 학습 파이프라인 — 연구실 GPU / VSCode-SSH �
   python obb_rotation_train.py --mode build    --data-root /data/pill_obb --convention 0
   python obb_rotation_train.py --mode train    --data-root /data/pill_obb
   # (verify에서 어느 열이 알약에 딱 붙는지 보고 --convention 0~3 지정)
+  # (박스가 알약을 자르면 --box-margin 1.15 처럼 키우면 됨)
 """
 
 from __future__ import annotations
@@ -57,6 +59,8 @@ def parse_args() -> argparse.Namespace:
 
     # 기하 convention (verify로 정함)
     p.add_argument("--convention", type=int, default=0, choices=range(len(CONVENTIONS)))
+    p.add_argument("--box-margin", type=float, default=1.0,
+                   help="회전박스 크기 배수 (1.0=bbox 감쌈, >1 여유 더). 절대 안 잘리게 감싸는 방식")
 
     # 학습
     p.add_argument("--model", default="yolo11n-obb.pt")
@@ -106,29 +110,17 @@ def filter_split(m: pd.DataFrame, man: pd.DataFrame, quality: list[str],
 
 
 # ---------------------------------------------------------------------------- geometry
-def reconstruct_rect(bw: float, bh: float, phi_deg: float) -> tuple[float, float]:
-    """축정렬 bbox(bw,bh) + 박스각(phi) → 꽉 끼는 회전사각형의 길이 L, 폭 S.
-    가정: 알약을 회전사각형으로 근사. Wa=L|cos|+S|sin|, Ha=L|sin|+S|cos| 연립.
-    30도 격자라 45도(특이) 안 걸림. 실패 시 축정렬 박스로 폴백."""
-    r = math.radians(phi_deg)
-    c, s = abs(math.cos(r)), abs(math.sin(r))
-    d = c * c - s * s
-    if abs(d) < 1e-6:
-        return bw, bh
-    L = (bw * c - bh * s) / d
-    S = (bh * c - bw * s) / d
-    if L <= 0 or S <= 0:
-        return bw, bh
-    return L, S
-
-
-def obb_corners_px(cx, cy, bw, bh, theta_deg, sign, offset):
-    """이미지 픽셀 좌표(x→우, y→하) 기준 회전사각형 4점."""
+def obb_corners_px(cx, cy, bw, bh, theta_deg, sign, offset, margin=1.0):
+    """이미지 픽셀 좌표(x→우, y→하) 기준 회전사각형 4점.
+    축정렬 bbox를 '포함'하는 회전박스 → 알약이 절대 안 잘림(각도만 정확, 크기는 여유).
+    margin>1 이면 사방 여유 더. 다운스트림에서 한 번 더 tight crop 전제."""
     phi = (sign * theta_deg + offset) % 180
-    L, S = reconstruct_rect(bw, bh, phi)
     r = math.radians(phi)
-    ux, uy = math.cos(r), math.sin(r)          # length 축
-    vx, vy = -math.sin(r), math.cos(r)         # width 축
+    c, s = abs(math.cos(r)), abs(math.sin(r))
+    L = (bw * c + bh * s) * margin      # 긴 축: 축정렬 bbox를 감싸는 크기
+    S = (bw * s + bh * c) * margin      # 짧은 축
+    ux, uy = math.cos(r), math.sin(r)   # length 축
+    vx, vy = -math.sin(r), math.cos(r)  # width 축
     hl, hs = L / 2, S / 2
     return [
         (cx + hl * ux + hs * vx, cy + hl * uy + hs * vy),
@@ -138,11 +130,11 @@ def obb_corners_px(cx, cy, bw, bh, theta_deg, sign, offset):
     ]
 
 
-def obb_label_line(row, sign, offset) -> str:
+def obb_label_line(row, sign, offset, margin=1.0) -> str:
     cx = row["bbox_x"] + row["bbox_w"] / 2
     cy = row["bbox_y"] + row["bbox_h"] / 2
     pts = obb_corners_px(cx, cy, row["bbox_w"], row["bbox_h"],
-                         row["rotation_label_deg"], sign, offset)
+                         row["rotation_label_deg"], sign, offset, margin)
     W, H = row["width"], row["height"]
     coords = []
     for x, y in pts:
@@ -181,7 +173,8 @@ def img_source(args, split):
 def cmd_build(args, work):
     sign, offset = CONVENTIONS[args.convention]
     print(f"[build] convention={args.convention} (sign={sign}, offset={offset}), "
-          f"quality={args.quality}, complete={'no' if args.allow_incomplete else 'yes'}")
+          f"box_margin={args.box_margin}, quality={args.quality}, "
+          f"complete={'no' if args.allow_incomplete else 'yes'}")
     _, man = load_merged(args, "train")
 
     yaml_lines = [f"path: {work / 'dataset'}", "train: images/train", "val: images/val",
@@ -205,7 +198,7 @@ def cmd_build(args, work):
             if src is None:
                 miss += 1
                 continue
-            lines = [obb_label_line(r, sign, offset) for _, r in grp.iterrows()]
+            lines = [obb_label_line(r, sign, offset, args.box_margin) for _, r in grp.iterrows()]
             (lbl_dir / f"{Path(fname).stem}.txt").write_text("\n".join(lines))
             link = img_dir / fname
             if not link.exists():
@@ -248,7 +241,7 @@ def cmd_verify(args, work, n_samples=6):
             if img is not None:
                 ax.imshow(img)
                 pts = obb_corners_px(cx, cy, row["bbox_w"], row["bbox_h"],
-                                     row["rotation_label_deg"], sign, offset)
+                                     row["rotation_label_deg"], sign, offset, args.box_margin)
                 poly = plt.Polygon(pts, fill=False, edgecolor="lime", linewidth=2)
                 ax.add_patch(poly)
             if c == 0:
