@@ -18,16 +18,26 @@ Pill OBB (oriented bbox) 학습 파이프라인 — 연구실 GPU / VSCode-SSH �
   python obb_rotation_train.py --mode verify   --data-root /data/pill_obb      # 먼저: convention_grid.png 확인
   python obb_rotation_train.py --mode build    --data-root /data/pill_obb --convention 0
   python obb_rotation_train.py --mode train    --data-root /data/pill_obb
+  python obb_rotation_train.py --mode predict  --data-root /data/pill_obb   # 예측 라벨 굳혀 배포
   # (verify에서 어느 열이 알약에 딱 붙는지 보고 --convention 0~3 지정)
   # (박스가 알약을 자르면 --box-margin 1.15 처럼 키우면 됨)
+
+배포(predict):
+  best.pt 예측을 object_id별 top-1 OBB로 굳혀 CSV(work/predictions/obb_predictions_{split}.csv)로 저장.
+  팀원은 YOLO 없이  manifest.merge(pred, on="object_id", how="left")  한 줄로 붙임.
+  컬럼: object_id, image_file, pred_cx/cy/w/h, pred_angle_deg(0~180 기울기), pred_conf,
+        match_iou, n_cand(중복검출 collapse 수), matched, px1..py4(폴리곤 픽셀).
+  provenance(.meta.json): 모델 sha256 · git commit · conf/iou 임계 → 원본 갱신 시 재생성 근거.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import shutil
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -41,7 +51,8 @@ CONVENTIONS = [(+1, 0), (+1, 90), (-1, 0), (-1, 90)]
 # ----------------------------------------------------------------------------- config
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["verify", "build", "train", "all", "straighten"], default="build")
+    p.add_argument("--mode", choices=["verify", "build", "train", "all", "straighten", "predict"],
+                   default="build")
     p.add_argument("--data-root", type=Path, required=True,
                    help="아래 파일들이 있는 로컬 디렉토리")
     p.add_argument("--rot-train", default="ys_rotation_labels_train_v1.csv")
@@ -67,6 +78,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--straight-pad", type=float, default=0.10, help="crop 여백 비율")
     p.add_argument("--straight-sign", type=int, default=-1, choices=[-1, 1],
                    help="회전 부호. straighten_check.png에서 글자가 뒤집혀 나오면 반대로")
+
+    # predict (예측 라벨 굳혀 배포: object_id별 top-1 OBB → manifest 조인용 CSV)
+    p.add_argument("--weights", type=Path, default=None,
+                   help="best.pt 경로 (기본: work/runs/**/weights/best.pt 최신본)")
+    p.add_argument("--pred-out", type=Path, default=None,
+                   help="예측 CSV 저장 위치 (기본 work/predictions)")
+    p.add_argument("--pred-conf", type=float, default=0.25,
+                   help="검출 conf 임계 (top-1 dedup 이전 raw 검출)")
+    p.add_argument("--pred-iou", type=float, default=0.30,
+                   help="예측↔GT bbox 매칭 IoU 임계 (object_id 배정 기준)")
+    p.add_argument("--pred-splits", nargs="+", default=["train", "val"],
+                   choices=["train", "val"], help="예측을 굳힐 split")
 
     # 학습
     p.add_argument("--model", default="yolo11n-obb.pt")
@@ -460,6 +483,134 @@ def cmd_straighten(args, work):
     print(f"[straighten] 완료 → {out_root}")
 
 
+def _poly_to_xyxy(poly):
+    """OBB 4점 → 축정렬 외접박스 (x0,y0,x1,y1). GT bbox와 IoU 매칭용."""
+    xs, ys = poly[:, 0], poly[:, 1]
+    return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+
+
+def _iou_xyxy(a, b):
+    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
+
+
+def _resolve_weights(args, work):
+    if args.weights is not None:
+        return Path(args.weights)
+    cands = sorted((work / "runs").rglob("weights/best.pt"),
+                   key=lambda p: p.stat().st_mtime)
+    assert cands, "best.pt 자동탐색 실패 — --weights 로 경로 지정"
+    return cands[-1]
+
+
+def _provenance(weights: Path, args) -> dict:
+    import hashlib
+    sha = hashlib.sha256(weights.read_bytes()).hexdigest()[:16]
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "--short", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        commit = None
+    try:
+        import ultralytics
+        uv = ultralytics.__version__
+    except Exception:
+        uv = None
+    return {"weights": str(weights), "weights_sha256_16": sha, "git_commit": commit,
+            "ultralytics": uv, "imgsz": args.imgsz,
+            "pred_conf": args.pred_conf, "pred_iou_assign": args.pred_iou}
+
+
+def cmd_predict(args, work):
+    """best.pt 예측을 object_id별 top-1 OBB로 굳혀 CSV 배포 (팀원 manifest 조인용).
+
+    각 예측 OBB를 manifest GT bbox와 IoU 매칭해 object_id 부여 → 한 알약에 예측이 여러 개면
+    (박스 2개 중복검출) conf 최고 1개만 남김(top-1). GT는 있는데 예측 없으면 matched=False (NaN)로
+    남겨 조인이 안전하게 degrade. angle은 OBB 기울기(0~180°); 세우려면 -pred_angle_deg 회전 후
+    위/아래는 별도 해소(OCR/DB). 조인:  manifest.merge(pred, on='object_id', how='left')
+    """
+    from ultralytics import YOLO
+    weights = _resolve_weights(args, work)
+    model = YOLO(str(weights))
+    prov = _provenance(weights, args)
+    out_root = args.pred_out or (work / "predictions")
+    out_root.mkdir(parents=True, exist_ok=True)
+    _, man = load_merged(args, "train")          # 좌표 GT(모든 split 공용); 회전 quality 필터 안 함
+    print(f"[predict] weights={weights.name} (sha {prov['weights_sha256_16']}), "
+          f"conf={args.pred_conf}, iou_assign={args.pred_iou}")
+
+    for split in args.pred_splits:
+        lut = ensure_images(img_source(args, split), work / "raw" / split)
+        gt = man[man["image_file"].isin(lut.keys())].copy()
+        img_files = sorted(gt["image_file"].unique())
+        rows, st = [], dict(imgs=0, gt=0, matched=0, dup=0, extra=0, no_pred=0)
+        BATCH = 48
+        for i in range(0, len(img_files), BATCH):
+            chunk = img_files[i:i + BATCH]
+            results = model.predict(source=[str(lut[f]) for f in chunk],
+                                    imgsz=args.imgsz, conf=args.pred_conf, verbose=False)
+            for fname, r in zip(chunk, results):
+                st["imgs"] += 1
+                preds = []
+                obb = getattr(r, "obb", None)
+                if obb is not None and getattr(obb, "xyxyxyxy", None) is not None and len(obb) > 0:
+                    polys = obb.xyxyxyxy.cpu().numpy()
+                    xywhr = obb.xywhr.cpu().numpy()
+                    confs = obb.conf.cpu().numpy()
+                    for k in range(len(polys)):
+                        preds.append({"poly": polys[k], "xywhr": xywhr[k],
+                                      "conf": float(confs[k]), "env": _poly_to_xyxy(polys[k])})
+                used = [False] * len(preds)
+                for _, g in gt[gt["image_file"] == fname].iterrows():
+                    st["gt"] += 1
+                    gbox = (g["bbox_x"], g["bbox_y"],
+                            g["bbox_x"] + g["bbox_w"], g["bbox_y"] + g["bbox_h"])
+                    cand = [(k, _iou_xyxy(preds[k]["env"], gbox)) for k in range(len(preds))]
+                    cand = [(k, iou) for k, iou in cand if iou >= args.pred_iou]
+                    row = {"object_id": g["object_id"], "image_file": fname}
+                    if cand:
+                        kb, ib = max(cand, key=lambda t: (preds[t[0]]["conf"], t[1]))
+                        p = preds[kb]
+                        cx, cy, w, h, rad = (float(v) for v in p["xywhr"])
+                        row.update(pred_cx=cx, pred_cy=cy, pred_w=w, pred_h=h,
+                                   pred_angle_deg=math.degrees(rad) % 180.0,
+                                   pred_conf=p["conf"], match_iou=float(ib),
+                                   n_cand=len(cand), matched=True)
+                        for ci, (px, py) in enumerate(p["poly"]):
+                            row[f"px{ci + 1}"], row[f"py{ci + 1}"] = float(px), float(py)
+                        used[kb] = True
+                        st["matched"] += 1
+                        if len(cand) > 1:
+                            st["dup"] += 1
+                    else:
+                        row["matched"] = False
+                        st["no_pred"] += 1
+                    rows.append(row)
+                st["extra"] += sum(1 for u in used if not u)
+
+        df = pd.DataFrame(rows)
+        csv_path = out_root / f"obb_predictions_{split}.csv"
+        df.to_csv(csv_path, index=False)
+        (out_root / f"obb_predictions_{split}.meta.json").write_text(
+            json.dumps({**prov, "split": split, "n_rows": len(df), **st},
+                       ensure_ascii=False, indent=2))
+        cov = st["matched"] / st["gt"] if st["gt"] else 0.0
+        print(f"  [{split}] 이미지 {st['imgs']:,} / GT {st['gt']:,} / 매칭 {st['matched']:,} "
+              f"({cov:.1%}) / 중복collapse {st['dup']:,} / 미검출 {st['no_pred']:,} / "
+              f"GT밖 예측 {st['extra']:,}")
+        print(f"          → {csv_path.name} (+ .meta.json)")
+    print(f"[predict] 완료 → {out_root}\n"
+          f"          조인:  manifest.merge(pd.read_csv('obb_predictions_<split>.csv'), "
+          f"on='object_id', how='left')")
+
+
 def cmd_train(args, work):
     from ultralytics import YOLO
     data_yaml = work / "dataset" / "dataset.yaml"
@@ -491,6 +642,8 @@ def main():
         cmd_build(args, work)
     if args.mode in ("straighten",):
         cmd_straighten(args, work)
+    if args.mode in ("predict",):
+        cmd_predict(args, work)
     if args.mode in ("train", "all"):
         cmd_train(args, work)
 
