@@ -641,11 +641,10 @@ def cmd_predict(args, work):
                         sel = next(c for c in cand if c[0] == kb)
                         p = preds[kb]
                         cx, cy, w, h, rad = (float(v) for v in p["xywhr"])
-                        # 장축(0~180°): xywhr의 r은 width축 방향 → w<h면 장축은 +90°.
-                        # deg(r)만 쓰면 세로형 박스에서 90° 어긋남(세우기용은 장축이 맞음).
-                        long_deg = (math.degrees(rad) + (0.0 if w >= h else 90.0)) % 180.0
+                        # r은 이미 장축(long-axis) 방향 — 재생성 CSV의 폴리곤 장축과 7470/7470 일치 검증(2026-07-03).
+                        # (w/h로 +90° 보정하면 near-square 박스에서 랜덤 90° 오류 → 보정 금지)
                         row.update(pred_cx=cx / ow, pred_cy=cy / oh, pred_w=w / ow, pred_h=h / oh,
-                                   pred_angle_deg=long_deg,
+                                   pred_angle_deg=math.degrees(rad) % 180.0,
                                    pred_conf=p["conf"], match_iou=float(sel[3]),
                                    match_dist=float(sel[2]), n_cand=len(cand), matched=True)
                         for ci, (px, py) in enumerate(p["poly"]):
