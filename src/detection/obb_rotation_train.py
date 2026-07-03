@@ -25,8 +25,9 @@ Pill OBB (oriented bbox) 학습 파이프라인 — 연구실 GPU / VSCode-SSH �
 배포(predict):
   best.pt 예측을 object_id별 top-1 OBB로 굳혀 CSV(work/predictions/obb_predictions_{split}.csv)로 저장.
   팀원은 YOLO 없이  manifest.merge(pred, on="object_id", how="left")  한 줄로 붙임.
-  컬럼: object_id, image_file, pred_cx/cy/w/h, pred_angle_deg(0~180 기울기), pred_conf,
-        match_iou, n_cand(중복검출 collapse 수), matched, px1..py4(폴리곤 픽셀).
+  컬럼: object_id, image_file, pred_cx/cy/w/h([0,1] 정규화; ×이미지 W/H로 픽셀화),
+        pred_angle_deg(0~180 기울기), pred_conf, match_iou, n_cand(중복검출 collapse 수),
+        matched, px1..py4(폴리곤 [0,1]). ※좌표는 파일 크기·manifest W/H 불일치에 안전한 정규화.
   provenance(.meta.json): 모델 sha256 · git commit · conf/iou 임계 → 원본 갱신 시 재생성 근거.
 """
 
@@ -531,9 +532,10 @@ def _provenance(weights: Path, args) -> dict:
 def cmd_predict(args, work):
     """best.pt 예측을 object_id별 top-1 OBB로 굳혀 CSV 배포 (팀원 manifest 조인용).
 
-    각 예측 OBB를 manifest GT bbox와 IoU 매칭해 object_id 부여 → 한 알약에 예측이 여러 개면
-    (박스 2개 중복검출) conf 최고 1개만 남김(top-1). GT는 있는데 예측 없으면 matched=False (NaN)로
-    남겨 조인이 안전하게 degrade. angle은 OBB 기울기(0~180°); 세우려면 -pred_angle_deg 회전 후
+    좌표는 [0,1] 정규화(예측은 실제 파일 orig_shape, GT는 manifest width/height 기준)로 맞춰
+    IoU 매칭 → 파일 크기와 manifest W/H가 달라도 안전. 한 알약에 예측이 여러 개면(박스 2개
+    중복검출) conf 최고 1개만 남김(top-1). GT는 있는데 예측 없으면 matched=False(NaN)로 남겨
+    조인이 안전하게 degrade. angle은 OBB 기울기(0~180°); 세우려면 -pred_angle_deg 회전 후
     위/아래는 별도 해소(OCR/DB). 조인:  manifest.merge(pred, on='object_id', how='left')
     """
     from ultralytics import YOLO
@@ -551,6 +553,7 @@ def cmd_predict(args, work):
         gt = man[man["image_file"].isin(lut.keys())].copy()
         img_files = sorted(gt["image_file"].unique())
         rows, st = [], dict(imgs=0, gt=0, matched=0, dup=0, extra=0, no_pred=0)
+        dbg = True                                   # 첫 GT 1건 좌표계 진단 출력
         BATCH = 48
         for i in range(0, len(img_files), BATCH):
             chunk = img_files[i:i + BATCH]
@@ -558,10 +561,11 @@ def cmd_predict(args, work):
                                     imgsz=args.imgsz, conf=args.pred_conf, verbose=False)
             for fname, r in zip(chunk, results):
                 st["imgs"] += 1
+                oh, ow = getattr(r, "orig_shape", (None, None))   # 실제 파일 (H, W)
                 preds = []
                 obb = getattr(r, "obb", None)
-                if obb is not None and getattr(obb, "xyxyxyxy", None) is not None and len(obb) > 0:
-                    polys = obb.xyxyxyxy.cpu().numpy()
+                if ow and obb is not None and getattr(obb, "xyxyxyxy", None) is not None and len(obb) > 0:
+                    polys = obb.xyxyxyxy.cpu().numpy() / np.array([ow, oh], dtype=np.float64)  # → [0,1]
                     xywhr = obb.xywhr.cpu().numpy()
                     confs = obb.conf.cpu().numpy()
                     for k in range(len(polys)):
@@ -570,16 +574,23 @@ def cmd_predict(args, work):
                 used = [False] * len(preds)
                 for _, g in gt[gt["image_file"] == fname].iterrows():
                     st["gt"] += 1
-                    gbox = (g["bbox_x"], g["bbox_y"],
-                            g["bbox_x"] + g["bbox_w"], g["bbox_y"] + g["bbox_h"])
-                    cand = [(k, _iou_xyxy(preds[k]["env"], gbox)) for k in range(len(preds))]
-                    cand = [(k, iou) for k, iou in cand if iou >= args.pred_iou]
+                    Wm, Hm = float(g["width"]), float(g["height"])
                     row = {"object_id": g["object_id"], "image_file": fname}
+                    cand = []
+                    if Wm > 0 and Hm > 0 and preds:                # 양쪽 다 [0,1] 정규화 후 IoU
+                        gbox = (g["bbox_x"] / Wm, g["bbox_y"] / Hm,
+                                (g["bbox_x"] + g["bbox_w"]) / Wm, (g["bbox_y"] + g["bbox_h"]) / Hm)
+                        ious = [(k, _iou_xyxy(preds[k]["env"], gbox)) for k in range(len(preds))]
+                        if dbg:
+                            print(f"  [dbg] {fname}: file={ow}x{oh} manifest={int(Wm)}x{int(Hm)} "
+                                  f"best_iou={max((iou for _, iou in ious), default=0.0):.2f}")
+                            dbg = False
+                        cand = [(k, iou) for k, iou in ious if iou >= args.pred_iou]
                     if cand:
                         kb, ib = max(cand, key=lambda t: (preds[t[0]]["conf"], t[1]))
                         p = preds[kb]
                         cx, cy, w, h, rad = (float(v) for v in p["xywhr"])
-                        row.update(pred_cx=cx, pred_cy=cy, pred_w=w, pred_h=h,
+                        row.update(pred_cx=cx / ow, pred_cy=cy / oh, pred_w=w / ow, pred_h=h / oh,
                                    pred_angle_deg=math.degrees(rad) % 180.0,
                                    pred_conf=p["conf"], match_iou=float(ib),
                                    n_cand=len(cand), matched=True)
