@@ -154,14 +154,15 @@ def filter_split(m: pd.DataFrame, man: pd.DataFrame, quality: list[str],
 
 
 # ---------------------------------------------------------------------------- geometry
-TIGHT_MIN_DET = 0.25   # |cos(2φ)| 하한 — φ가 45/135°에 ±15° 이내면 역산 특이 → fallback
+TIGHT_MIN_DET = 0.25    # |cos(2φ)| 하한 — φ가 45/135°에 ±15° 이내면 역산 특이 → fallback
+TIGHT_MAX_ASPECT = 4.0  # 역산 종횡비 상한 — 넘으면 얇은막대/거대박스(라벨-기하 불일치) → fallback
 
 
 def _box_ls(bw, bh, r, margin, box_mode):
     """박스 (긴축 L, 짧은축 S, used_tight) 반환.
     containment: 축정렬 bbox를 감싸는 크기(L=bw·c+bh·s). 기울면 정사각 → 각도 소실.
     tight: bbox를 알약 '그림자'로 보고 진짜 길이 P·폭 Q 역산(bw=P·c+Q·s, bh=P·s+Q·c).
-           φ≈45/135°(특이) 또는 비물리(P·Q≤0)면 containment로 fallback.
+           φ≈45/135°(특이)·비물리(P·Q≤0)·과대종횡비(>MAX, 얇은막대)면 containment로 fallback.
     두 경우 모두 margin 배. tight 박스의 축정렬 외접범위 = margin×(bw,bh) 이라 margin≥1이면 알약 범위 덮음."""
     c, s = abs(math.cos(r)), abs(math.sin(r))
     if box_mode == "tight":
@@ -169,8 +170,8 @@ def _box_ls(bw, bh, r, margin, box_mode):
         if abs(det) >= TIGHT_MIN_DET:
             P = (c * bw - s * bh) / det
             Q = (c * bh - s * bw) / det
-            if P > 0 and Q > 0:
-                return P * margin, Q * margin, True
+            if P > 0 and Q > 0 and max(P, Q) / min(P, Q) <= TIGHT_MAX_ASPECT:
+                return P * margin, Q * margin, True   # 얇은막대(과대종횡비)는 여기서 걸러 fallback
     return (bw * c + bh * s) * margin, (bw * s + bh * c) * margin, False
 
 
@@ -361,12 +362,14 @@ def cmd_build(args, work):
                 os.symlink(src.resolve(), link)
             n_img += 1
             n_obj += len(lines)
-        med_asp = sorted(aspects)[len(aspects) // 2] if aspects else 0.0
+        sa = sorted(aspects)
+        med_asp = sa[len(sa) // 2] if sa else 0.0
+        p90_asp = sa[min(len(sa) - 1, int(len(sa) * 0.9))] if sa else 0.0
         print(f"  [{split}] 이미지 {n_img:,} / 알약 {n_obj:,}  (원본 누락 {miss})")
         if args.box_mode == "tight":
             fb = n_obj - n_tight
-            print(f"        tight 성공 {n_tight:,} / fallback {fb:,}({100*fb/max(n_obj,1):.0f}%, 45°근방·비물리) "
-                  f"· 박스 종횡비 median={med_asp:.2f} (1이면 정사각=각도소실, 클수록 갸름)")
+            print(f"        tight 성공 {n_tight:,} / fallback {fb:,}({100*fb/max(n_obj,1):.0f}%: 45°근방·비물리·과대종횡비) "
+                  f"· 성공박스 종횡비 median={med_asp:.2f} p90={p90_asp:.2f} (캡슐 오블롱이면 p90≈2~3)")
 
     (work / "dataset" / "dataset.yaml").write_text("\n".join(yaml_lines) + "\n")
     print(f"[build] dataset.yaml → {work / 'dataset' / 'dataset.yaml'}")
