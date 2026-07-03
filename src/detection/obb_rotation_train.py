@@ -17,6 +17,7 @@ Pill OBB (oriented bbox) 학습 파이프라인 — 연구실 GPU / VSCode-SSH �
 사용:
   python obb_rotation_train.py --mode verify   --data-root /data/pill_obb      # 먼저: convention_grid.png 확인
   python obb_rotation_train.py --mode build    --data-root /data/pill_obb --convention 0
+  #   --box-mode tight --box-margin 1.25  → 감싸기 대신 역산(갸름 박스, 각도 학습가능). 잘림리포트+오버레이 확인 후 학습
   python obb_rotation_train.py --mode train    --data-root /data/pill_obb
   python obb_rotation_train.py --mode predict  --data-root /data/pill_obb   # 예측 라벨 굳혀 배포
   python obb_rotation_train.py --mode angle-diag --data-root /data/pill_obb --convention <build값>  # 각도 붕괴 진단
@@ -74,7 +75,9 @@ def parse_args() -> argparse.Namespace:
     # 기하 convention (verify로 정함)
     p.add_argument("--convention", type=int, default=0, choices=range(len(CONVENTIONS)))
     p.add_argument("--box-margin", type=float, default=1.0,
-                   help="회전박스 크기 배수 (1.0=bbox 감쌈, >1 여유 더). 절대 안 잘리게 감싸는 방식")
+                   help="회전박스 크기 배수 (1.0=bbox 감쌈, >1 여유 더). tight 모드는 1.2~1.3 권장(잘림 방지)")
+    p.add_argument("--box-mode", choices=["containment", "tight"], default="containment",
+                   help="containment=bbox 감싸기(기울면 정사각·각도소실) / tight=역산(갸름·각도학습가능, 45°근방은 fallback)")
     # straighten (OCR/분류 학습용: GT 각도로 펴서 저장 + zip)
     p.add_argument("--straight-out", type=Path, default=None,
                    help="펴진 crop 저장 위치 (기본 data-root/straightened)")
@@ -151,15 +154,33 @@ def filter_split(m: pd.DataFrame, man: pd.DataFrame, quality: list[str],
 
 
 # ---------------------------------------------------------------------------- geometry
-def obb_corners_px(cx, cy, bw, bh, theta_deg, sign, offset, margin=1.0):
+TIGHT_MIN_DET = 0.25   # |cos(2φ)| 하한 — φ가 45/135°에 ±15° 이내면 역산 특이 → fallback
+
+
+def _box_ls(bw, bh, r, margin, box_mode):
+    """박스 (긴축 L, 짧은축 S, used_tight) 반환.
+    containment: 축정렬 bbox를 감싸는 크기(L=bw·c+bh·s). 기울면 정사각 → 각도 소실.
+    tight: bbox를 알약 '그림자'로 보고 진짜 길이 P·폭 Q 역산(bw=P·c+Q·s, bh=P·s+Q·c).
+           φ≈45/135°(특이) 또는 비물리(P·Q≤0)면 containment로 fallback.
+    두 경우 모두 margin 배. tight 박스의 축정렬 외접범위 = margin×(bw,bh) 이라 margin≥1이면 알약 범위 덮음."""
+    c, s = abs(math.cos(r)), abs(math.sin(r))
+    if box_mode == "tight":
+        det = c * c - s * s                         # = cos(2φ)
+        if abs(det) >= TIGHT_MIN_DET:
+            P = (c * bw - s * bh) / det
+            Q = (c * bh - s * bw) / det
+            if P > 0 and Q > 0:
+                return P * margin, Q * margin, True
+    return (bw * c + bh * s) * margin, (bw * s + bh * c) * margin, False
+
+
+def obb_corners_px(cx, cy, bw, bh, theta_deg, sign, offset, margin=1.0, box_mode="containment"):
     """이미지 픽셀 좌표(x→우, y→하) 기준 회전사각형 4점.
-    축정렬 bbox를 '포함'하는 회전박스 → 알약이 절대 안 잘림(각도만 정확, 크기는 여유).
-    margin>1 이면 사방 여유 더. 다운스트림에서 한 번 더 tight crop 전제."""
+    box_mode=containment(기본): bbox 감싸기(안 잘림, 기울면 정사각).
+    box_mode=tight: 알약 진짜 치수 역산(갸름, 각도 학습 가능; 특이/비물리는 자동 fallback)."""
     phi = (sign * theta_deg + offset) % 180
     r = math.radians(phi)
-    c, s = abs(math.cos(r)), abs(math.sin(r))
-    L = (bw * c + bh * s) * margin      # 긴 축: 축정렬 bbox를 감싸는 크기
-    S = (bw * s + bh * c) * margin      # 짧은 축
+    L, S, _ = _box_ls(bw, bh, r, margin, box_mode)
     ux, uy = math.cos(r), math.sin(r)   # length 축
     vx, vy = -math.sin(r), math.cos(r)  # width 축
     hl, hs = L / 2, S / 2
@@ -171,11 +192,11 @@ def obb_corners_px(cx, cy, bw, bh, theta_deg, sign, offset, margin=1.0):
     ]
 
 
-def obb_label_line(row, sign, offset, margin=1.0) -> str:
+def obb_label_line(row, sign, offset, margin=1.0, box_mode="containment") -> str:
     cx = row["bbox_x"] + row["bbox_w"] / 2
     cy = row["bbox_y"] + row["bbox_h"] / 2
     pts = obb_corners_px(cx, cy, row["bbox_w"], row["bbox_h"],
-                         row["rotation_label_deg"], sign, offset, margin)
+                         row["rotation_label_deg"], sign, offset, margin, box_mode)
     W, H = row["width"], row["height"]
     coords = []
     for x, y in pts:
@@ -302,7 +323,7 @@ def viz_predict_check(model, work, imgsz, n=12):
 def cmd_build(args, work):
     sign, offset = CONVENTIONS[args.convention]
     print(f"[build] convention={args.convention} (sign={sign}, offset={offset}), "
-          f"box_margin={args.box_margin}, quality={args.quality}, "
+          f"box_mode={args.box_mode}, box_margin={args.box_margin}, quality={args.quality}, "
           f"complete={'no' if args.allow_incomplete else 'yes'}")
     _, man = load_merged(args, "train")
 
@@ -321,20 +342,31 @@ def cmd_build(args, work):
             shutil.rmtree(d, ignore_errors=True)
             d.mkdir(parents=True, exist_ok=True)
 
-        n_img, n_obj, miss = 0, 0, 0
+        n_img, n_obj, miss, n_tight, aspects = 0, 0, 0, 0, []
         for fname, grp in df.groupby("image_file"):
             src = lut.get(fname)
             if src is None:
                 miss += 1
                 continue
-            lines = [obb_label_line(r, sign, offset, args.box_margin) for _, r in grp.iterrows()]
+            lines = []
+            for _, r in grp.iterrows():
+                lines.append(obb_label_line(r, sign, offset, args.box_margin, args.box_mode))
+                phi = math.radians((sign * r["rotation_label_deg"] + offset) % 180)
+                L, S, ut = _box_ls(r["bbox_w"], r["bbox_h"], phi, args.box_margin, args.box_mode)
+                n_tight += int(ut)
+                aspects.append(max(L, S) / max(min(L, S), 1e-9))
             (lbl_dir / f"{Path(fname).stem}.txt").write_text("\n".join(lines))
             link = img_dir / fname
             if not link.exists():
                 os.symlink(src.resolve(), link)
             n_img += 1
             n_obj += len(lines)
+        med_asp = sorted(aspects)[len(aspects) // 2] if aspects else 0.0
         print(f"  [{split}] 이미지 {n_img:,} / 알약 {n_obj:,}  (원본 누락 {miss})")
+        if args.box_mode == "tight":
+            fb = n_obj - n_tight
+            print(f"        tight 성공 {n_tight:,} / fallback {fb:,}({100*fb/max(n_obj,1):.0f}%, 45°근방·비물리) "
+                  f"· 박스 종횡비 median={med_asp:.2f} (1이면 정사각=각도소실, 클수록 갸름)")
 
     (work / "dataset" / "dataset.yaml").write_text("\n".join(yaml_lines) + "\n")
     print(f"[build] dataset.yaml → {work / 'dataset' / 'dataset.yaml'}")
@@ -375,7 +407,8 @@ def cmd_verify(args, work, n_samples=6):
             if img is not None:
                 ax.imshow(img)
                 pts = obb_corners_px(cx, cy, row["bbox_w"], row["bbox_h"],
-                                     row["rotation_label_deg"], sign, offset, args.box_margin)
+                                     row["rotation_label_deg"], sign, offset,
+                                     args.box_margin, args.box_mode)
                 poly = plt.Polygon(pts, fill=False, edgecolor="lime", linewidth=2)
                 ax.add_patch(poly)
             if c == 0:
