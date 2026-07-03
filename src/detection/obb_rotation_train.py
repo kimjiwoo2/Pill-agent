@@ -532,6 +532,36 @@ def _provenance(weights: Path, args) -> dict:
             "pred_iou_gate": args.pred_iou, "coords": "normalized_[0,1]"}
 
 
+def viz_pred_labels(out_root, split, df, lut, n=12):
+    """굳힌 top-1 OBB(CSV의 px1..py4 정규화폴리곤)를 이미지에 그려 확인.
+    raw 예측이 아니라 '알약당 1박스'로 dedup된 배포 라벨을 그림 → predict_labels_check_{split}.png"""
+    import cv2
+    if "matched" not in df.columns or not all(f"px{i}" in df.columns for i in range(1, 5)):
+        return
+    d = df[df["matched"] == True].copy()
+    if d.empty:
+        return
+    counts = d.groupby("image_file").size().sort_values(ascending=False)
+    multi = [f for f in counts.index if counts[f] >= 2][:4]      # 조합(다중 알약) 이미지 우선
+    singles = [f for f in counts.index if counts[f] == 1]
+    pick = list(multi)
+    if singles and n > len(pick):
+        idx = np.unique(np.linspace(0, len(singles) - 1, n - len(pick)).astype(int))
+        pick += [singles[i] for i in idx]
+    items = []
+    for f in pick[:n]:
+        p = lut.get(f)
+        img = cv2.imread(str(p)) if p is not None else None
+        if img is None:
+            continue
+        H, W = img.shape[:2]
+        polys = [[(r[f"px{i}"] * W, r[f"py{i}"] * H) for i in range(1, 5)]
+                 for _, r in d[d["image_file"] == f].iterrows()]
+        items.append((p, polys))
+    _draw_obb_grid(items, out_root / f"predict_labels_check_{split}.png",
+                   f"predict labels — {split} (굳힌 top-1 OBB, 알약당 1박스)")
+
+
 def cmd_predict(args, work):
     """best.pt 예측을 object_id별 top-1 OBB로 굳혀 CSV 배포 (팀원 manifest 조인용).
 
@@ -632,6 +662,10 @@ def cmd_predict(args, work):
               f"({cov:.1%}) / 중복collapse {st['dup']:,} / 미검출 {st['no_pred']:,} / "
               f"GT밖 예측 {st['extra']:,}")
         print(f"          → {csv_path.name} (+ .meta.json)")
+        try:                                         # sanity: 굳힌 top-1 라벨 눈으로 확인
+            viz_pred_labels(out_root, split, df, lut, args.viz_samples)
+        except Exception as e:
+            print(f"  [viz] predict labels {split} 실패(무시): {e}")
     print(f"[predict] 완료 → {out_root}\n"
           f"          조인:  manifest.merge(pd.read_csv('obb_predictions_<split>.csv'), "
           f"on='object_id', how='left')")
