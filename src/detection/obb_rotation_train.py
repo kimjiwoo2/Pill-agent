@@ -87,8 +87,10 @@ def parse_args() -> argparse.Namespace:
                    help="예측 CSV 저장 위치 (기본 work/predictions)")
     p.add_argument("--pred-conf", type=float, default=0.25,
                    help="검출 conf 임계 (top-1 dedup 이전 raw 검출)")
-    p.add_argument("--pred-iou", type=float, default=0.30,
-                   help="예측↔GT bbox 매칭 IoU 임계 (object_id 배정 기준)")
+    p.add_argument("--pred-iou", type=float, default=0.0,
+                   help="선택: 외접박스 IoU 최소 게이트 (기본 0=off; OBB가 느슨해 매칭은 중심 기반)")
+    p.add_argument("--pred-center-tol", type=float, default=0.03,
+                   help="예측 중심이 GT bbox 밖이어도 이 거리(정규화) 이내면 매칭 (기본 0.03)")
     p.add_argument("--pred-splits", nargs="+", default=["train", "val"],
                    choices=["train", "val"], help="예측을 굳힐 split")
 
@@ -525,8 +527,9 @@ def _provenance(weights: Path, args) -> dict:
     except Exception:
         uv = None
     return {"weights": str(weights), "weights_sha256_16": sha, "git_commit": commit,
-            "ultralytics": uv, "imgsz": args.imgsz,
-            "pred_conf": args.pred_conf, "pred_iou_assign": args.pred_iou}
+            "ultralytics": uv, "imgsz": args.imgsz, "pred_conf": args.pred_conf,
+            "match": "center-in-gtbox", "pred_center_tol": args.pred_center_tol,
+            "pred_iou_gate": args.pred_iou, "coords": "normalized_[0,1]"}
 
 
 def cmd_predict(args, work):
@@ -569,31 +572,43 @@ def cmd_predict(args, work):
                     xywhr = obb.xywhr.cpu().numpy()
                     confs = obb.conf.cpu().numpy()
                     for k in range(len(polys)):
-                        preds.append({"poly": polys[k], "xywhr": xywhr[k],
-                                      "conf": float(confs[k]), "env": _poly_to_xyxy(polys[k])})
+                        env = _poly_to_xyxy(polys[k])
+                        preds.append({"poly": polys[k], "xywhr": xywhr[k], "conf": float(confs[k]),
+                                      "env": env, "c": ((env[0] + env[2]) / 2, (env[1] + env[3]) / 2)})
                 used = [False] * len(preds)
                 for _, g in gt[gt["image_file"] == fname].iterrows():
                     st["gt"] += 1
                     Wm, Hm = float(g["width"]), float(g["height"])
                     row = {"object_id": g["object_id"], "image_file": fname}
                     cand = []
-                    if Wm > 0 and Hm > 0 and preds:                # 양쪽 다 [0,1] 정규화 후 IoU
-                        gbox = (g["bbox_x"] / Wm, g["bbox_y"] / Hm,
-                                (g["bbox_x"] + g["bbox_w"]) / Wm, (g["bbox_y"] + g["bbox_h"]) / Hm)
-                        ious = [(k, _iou_xyxy(preds[k]["env"], gbox)) for k in range(len(preds))]
+                    if Wm > 0 and Hm > 0 and preds:
+                        x0, y0 = g["bbox_x"] / Wm, g["bbox_y"] / Hm
+                        x1, y1 = (g["bbox_x"] + g["bbox_w"]) / Wm, (g["bbox_y"] + g["bbox_h"]) / Hm
+                        gcx, gcy = (x0 + x1) / 2, (y0 + y1) / 2
+                        # 매칭 = 예측 중심이 GT bbox 안(또는 tol 이내). OBB가 느슨/회전이라 외접
+                        # IoU는 중심이 맞아도 낮게 나오므로, 중심 기반이 견고. IoU는 참고용 게이트.
+                        for k in range(len(preds)):
+                            pcx, pcy = preds[k]["c"]
+                            inside = x0 <= pcx <= x1 and y0 <= pcy <= y1
+                            dist = math.hypot(pcx - gcx, pcy - gcy)
+                            if inside or dist <= args.pred_center_tol:
+                                iou = _iou_xyxy(preds[k]["env"], (x0, y0, x1, y1))
+                                if iou >= args.pred_iou:
+                                    cand.append((k, 1 if inside else 0, dist, iou))
                         if dbg:
+                            bi = max((c[3] for c in cand), default=0.0)
                             print(f"  [dbg] {fname}: file={ow}x{oh} manifest={int(Wm)}x{int(Hm)} "
-                                  f"best_iou={max((iou for _, iou in ious), default=0.0):.2f}")
+                                  f"cand={len(cand)} best_iou={bi:.2f}")
                             dbg = False
-                        cand = [(k, iou) for k, iou in ious if iou >= args.pred_iou]
                     if cand:
-                        kb, ib = max(cand, key=lambda t: (preds[t[0]]["conf"], t[1]))
+                        kb = max(cand, key=lambda t: (t[1], preds[t[0]]["conf"]))[0]
+                        sel = next(c for c in cand if c[0] == kb)
                         p = preds[kb]
                         cx, cy, w, h, rad = (float(v) for v in p["xywhr"])
                         row.update(pred_cx=cx / ow, pred_cy=cy / oh, pred_w=w / ow, pred_h=h / oh,
                                    pred_angle_deg=math.degrees(rad) % 180.0,
-                                   pred_conf=p["conf"], match_iou=float(ib),
-                                   n_cand=len(cand), matched=True)
+                                   pred_conf=p["conf"], match_iou=float(sel[3]),
+                                   match_dist=float(sel[2]), n_cand=len(cand), matched=True)
                         for ci, (px, py) in enumerate(p["poly"]):
                             row[f"px{ci + 1}"], row[f"py{ci + 1}"] = float(px), float(py)
                         used[kb] = True
