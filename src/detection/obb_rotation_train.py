@@ -19,6 +19,7 @@ Pill OBB (oriented bbox) 학습 파이프라인 — 연구실 GPU / VSCode-SSH �
   python obb_rotation_train.py --mode build    --data-root /data/pill_obb --convention 0
   python obb_rotation_train.py --mode train    --data-root /data/pill_obb
   python obb_rotation_train.py --mode predict  --data-root /data/pill_obb   # 예측 라벨 굳혀 배포
+  python obb_rotation_train.py --mode angle-diag --data-root /data/pill_obb --convention <build값>  # 각도 붕괴 진단
   # (verify에서 어느 열이 알약에 딱 붙는지 보고 --convention 0~3 지정)
   # (박스가 알약을 자르면 --box-margin 1.15 처럼 키우면 됨)
 
@@ -52,7 +53,8 @@ CONVENTIONS = [(+1, 0), (+1, 90), (-1, 0), (-1, 90)]
 # ----------------------------------------------------------------------------- config
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["verify", "build", "train", "all", "straighten", "predict"],
+    p.add_argument("--mode",
+                   choices=["verify", "build", "train", "all", "straighten", "predict", "angle-diag"],
                    default="build")
     p.add_argument("--data-root", type=Path, required=True,
                    help="아래 파일들이 있는 로컬 디렉토리")
@@ -93,6 +95,10 @@ def parse_args() -> argparse.Namespace:
                    help="예측 중심이 GT bbox 밖이어도 이 거리(정규화) 이내면 매칭 (기본 0.03)")
     p.add_argument("--pred-splits", nargs="+", default=["train", "val"],
                    choices=["train", "val"], help="예측을 굳힐 split")
+
+    # angle-diag (OBB 각도 붕괴 진단: GT 라벨 각도·박스종횡비 vs best.pt 예측 각도)
+    p.add_argument("--diag-n", type=int, default=300,
+                   help="예측 각도 분포 측정용 val 이미지 수")
 
     # 학습
     p.add_argument("--model", default="yolo11n-obb.pt")
@@ -692,6 +698,81 @@ def cmd_train(args, work):
         print(f"  [viz] predict check 실패(무시): {e}")
 
 
+def cmd_angle_diag(args, work):
+    """OBB 각도 붕괴 진단. 배포된 pred_angle_deg가 ≈상수(49.5°±4°)로 죽어 있는데,
+    원인이 (a)컨테인먼트 라벨 기하(near-square라 각도 소실) / (b)회전라벨 자체가 안 변함 /
+    (c)predict export가 w/h 스왑을 안 반영 중 무엇인지 가른다. 모델 없이도 GT 쪽 신호로 절반 판정.
+
+    GT 박스 각도 phi=(sign*rotation_label+offset)%180, 컨테인먼트 종횡비 L/S=(bw·|c|+bh·|s|)/(bw·|s|+bh·|c|)
+    — 이 L/S가 phi≈45°에서 1(정사각)로 붕괴하면 각도가 학습 불가.
+    """
+    sign, offset = CONVENTIONS[args.convention]
+    _, man = load_merged(args, "train")
+    print("=" * 66)
+    print(f"[angle-diag] convention={args.convention} (sign={sign}, offset={offset}), "
+          f"box_margin={args.box_margin}")
+    print("-- GT 라벨: 회전각 다양성 & 컨테인먼트 박스 종횡비 --")
+    for split in ("train", "val"):
+        m, _ = load_merged(args, split)
+        df = filter_split(m, man, args.quality, require_complete=not args.allow_incomplete)
+        if df.empty:
+            print(f"  [{split}] (없음)")
+            continue
+        theta = df["rotation_label_deg"].to_numpy(float)
+        phi = (sign * theta + offset) % 180.0
+        r = np.radians(phi)
+        c, s = np.abs(np.cos(r)), np.abs(np.sin(r))
+        bw, bh = df["bbox_w"].to_numpy(float), df["bbox_h"].to_numpy(float)
+        L, S = bw * c + bh * s, bw * s + bh * c
+        asp = np.maximum(L, S) / np.maximum(np.minimum(L, S), 1e-9)
+        bbox_asp = np.maximum(bw, bh) / np.maximum(np.minimum(bw, bh), 1e-9)
+        print(f"  [{split}] n={len(df):,}  rotation_label std={theta.std():.1f}°  "
+              f"box_phi std={phi.std():.1f}°")
+        print(f"        bbox 종횡비 median={np.median(bbox_asp):.2f}  →  "
+              f"컨테인먼트 L/S median={np.median(asp):.2f} "
+              f"(p10={np.percentile(asp,10):.2f} p90={np.percentile(asp,90):.2f})  "
+              f"near-square(<1.2)={np.mean(asp < 1.2)*100:.0f}%")
+
+    # ---- 모델 예측 각도 분포 ----
+    from ultralytics import YOLO
+    weights = _resolve_weights(args, work)
+    model = YOLO(str(weights))
+    lut = ensure_images(img_source(args, "val"), work / "raw" / "val")
+    files = sorted(lut.keys())[: args.diag_n]
+    raw_r, long_ax, wgeh = [], [], []
+    BATCH = 48
+    for i in range(0, len(files), BATCH):
+        chunk = files[i:i + BATCH]
+        res = model.predict(source=[str(lut[f]) for f in chunk],
+                            imgsz=args.imgsz, conf=args.pred_conf, verbose=False)
+        for rr in res:
+            obb = getattr(rr, "obb", None)
+            if obb is None or getattr(obb, "xywhr", None) is None or len(obb) == 0:
+                continue
+            for x in obb.xywhr.cpu().numpy():
+                _, _, w, h, rad = (float(v) for v in x)
+                raw_r.append(math.degrees(rad) % 180.0)
+                long_ax.append((math.degrees(rad) + (0.0 if w >= h else 90.0)) % 180.0)
+                wgeh.append(1 if w >= h else 0)
+    raw_r, long_ax = np.array(raw_r), np.array(long_ax)
+    print("-" * 66)
+    print(f"-- 예측 (best.pt={weights.name}, val {len(files)} 이미지, 검출 {len(raw_r):,} 알약) --")
+    if len(raw_r):
+        print(f"  raw r     : mean={raw_r.mean():.1f}° std={raw_r.std():.1f}° "
+              f"min={raw_r.min():.1f} max={raw_r.max():.1f}")
+        print(f"  long-axis : mean={long_ax.mean():.1f}° std={long_ax.std():.1f}° "
+              f"(w>h 비율={np.mean(wgeh):.2f})")
+    else:
+        print("  (검출 0 — --weights/이미지 경로 확인)")
+    print("=" * 66)
+    print("판정:")
+    print("  · pred std < 10°  → 각도 붕괴 확정.")
+    print("  · GT rotation_label std 넓음(>25°) + near-square 높음  → 원인(a) 컨테인먼트 라벨이 각도 소실")
+    print("      → 처방: tight/seg 라벨 재구축 or OBB 각도 폐기하고 회전분류기.")
+    print("  · long-axis std >> raw r std        → 방향이 w/h 스왑에 있음 → 원인(c) predict export만 수정.")
+    print("  · GT rotation_label std 좁음(<10°)  → 원인(b) 회전라벨이 안 변함 → build 조인/라벨 점검.")
+
+
 def main():
     args = parse_args()
     work = args.work_dir or (args.data_root / "obb_work")
@@ -704,6 +785,8 @@ def main():
         cmd_straighten(args, work)
     if args.mode in ("predict",):
         cmd_predict(args, work)
+    if args.mode in ("angle-diag",):
+        cmd_angle_diag(args, work)
     if args.mode in ("train", "all"):
         cmd_train(args, work)
 
