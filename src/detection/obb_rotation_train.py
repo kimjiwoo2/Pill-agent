@@ -78,6 +78,8 @@ def parse_args() -> argparse.Namespace:
                    help="회전박스 크기 배수 (1.0=bbox 감쌈, >1 여유 더). tight 모드는 1.2~1.3 권장(잘림 방지)")
     p.add_argument("--box-mode", choices=["containment", "tight"], default="containment",
                    help="containment=bbox 감싸기(기울면 정사각·각도소실) / tight=역산(갸름·각도학습가능, 45°근방은 fallback)")
+    p.add_argument("--drop-fallback", action="store_true",
+                   help="tight 모드에서 fallback(정사각) 알약이 든 이미지를 통째로 드롭 — 각도 노이즈 제거(부분라벨=배경오염 방지). 원형 알약은 tight성공이라 안 빠짐")
     # straighten (OCR/분류 학습용: GT 각도로 펴서 저장 + zip)
     p.add_argument("--straight-out", type=Path, default=None,
                    help="펴진 crop 저장 위치 (기본 data-root/straightened)")
@@ -344,29 +346,40 @@ def cmd_build(args, work):
             d.mkdir(parents=True, exist_ok=True)
 
         n_img, n_obj, miss, n_tight, aspects = 0, 0, 0, 0, []
+        drop_img, drop_obj = 0, 0
         for fname, grp in df.groupby("image_file"):
             src = lut.get(fname)
             if src is None:
                 miss += 1
                 continue
-            lines = []
-            for _, r in grp.iterrows():
-                lines.append(obb_label_line(r, sign, offset, args.box_margin, args.box_mode))
+            rws = [r for _, r in grp.iterrows()]
+            info = []                                    # 알약별 (tight성공, 종횡비)
+            for r in rws:
                 phi = math.radians((sign * r["rotation_label_deg"] + offset) % 180)
                 L, S, ut = _box_ls(r["bbox_w"], r["bbox_h"], phi, args.box_margin, args.box_mode)
-                n_tight += int(ut)
-                aspects.append(max(L, S) / max(min(L, S), 1e-9))
+                info.append((ut, max(L, S) / max(min(L, S), 1e-9)))
+            if args.drop_fallback and args.box_mode == "tight" and not all(u for u, _ in info):
+                drop_img += 1                            # fallback 알약 든 이미지 통째로 드롭
+                drop_obj += len(rws)
+                continue
+            lines = [obb_label_line(r, sign, offset, args.box_margin, args.box_mode) for r in rws]
             (lbl_dir / f"{Path(fname).stem}.txt").write_text("\n".join(lines))
             link = img_dir / fname
             if not link.exists():
                 os.symlink(src.resolve(), link)
             n_img += 1
             n_obj += len(lines)
+            for u, a in info:
+                n_tight += int(u)
+                aspects.append(a)
         sa = sorted(aspects)
         med_asp = sa[len(sa) // 2] if sa else 0.0
         p90_asp = sa[min(len(sa) - 1, int(len(sa) * 0.9))] if sa else 0.0
         print(f"  [{split}] 이미지 {n_img:,} / 알약 {n_obj:,}  (원본 누락 {miss})")
-        if args.box_mode == "tight":
+        if args.box_mode == "tight" and args.drop_fallback:
+            print(f"        drop-fallback: 이미지 {drop_img:,}장/{drop_obj:,}알약 제외(잔여 전부 tight) "
+                  f"· 종횡비 median={med_asp:.2f} p90={p90_asp:.2f}")
+        elif args.box_mode == "tight":
             fb = n_obj - n_tight
             print(f"        tight 성공 {n_tight:,} / fallback {fb:,}({100*fb/max(n_obj,1):.0f}%: 45°근방·비물리·과대종횡비) "
                   f"· 성공박스 종횡비 median={med_asp:.2f} p90={p90_asp:.2f} (캡슐 오블롱이면 p90≈2~3)")
