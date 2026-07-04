@@ -10,8 +10,11 @@ OBB 예측을 이용해 알약을 '수평으로 세운' 왜곡 없는 crop 생�
   - 원본 full 이미지 폴더 or zip (image_file = 파일명)
 
 핵심 결정(변경 금지):
-  matched & angle_reliable → 폴리곤 장축각 θ로 IMAGE를 회전(BORDER_REPLICATE)해 장축을 수평화.
-  그 외(미매칭/각도 비신뢰) → 회전 없이 GT bbox 중심에서 crop.
+  matched → 폴리곤 장축각 θ로 IMAGE를 회전(BORDER_REPLICATE)해 장축을 전부 수평화(기본, --rotate all).
+    TTA 불가 환경이라 angle_reliable=False 여도 어차피 1회만 읽으므로 회전해도 손해 없음(통계상 무해).
+    이를 통해 회전 로직을 단일화. angle_reliable 은 판단 분기가 아니라 "각도 신뢰도 표시"로
+    manifest 에만 남긴다. --rotate reliable 지정 시 이전 정책(matched & angle_reliable 만 회전)으로 되돌릴 수 있음.
+  그 외(미매칭, 또는 --rotate reliable 에서 각도 비신뢰) → 회전 없이 GT bbox 중심에서 crop.
   회전은 점사상 p'=R(θ)(p−c)+c, R(θ)=[[cos,sin],[−sin,cos]] 이 각도 θ 벡터를 θ−a로 보내므로
   a=θ 를 쓰면 장축이 수평이 됨 → ±부호 논쟁 불필요.
 
@@ -133,11 +136,15 @@ def _crop_exact(img: np.ndarray, cx: float, cy: float, w: int, h: int) -> np.nda
     return img[y0:y0 + h, x0:x0 + w]
 
 
-def upright_crop(img: np.ndarray, row, mode: str = "square", margin: float = 1.3):
+def upright_crop(img: np.ndarray, row, mode: str = "square", margin: float = 1.3,
+                 rotate: str = "all"):
     """알약 1개를 수평으로 세운 crop + meta 반환.
 
-    matched & angle_reliable → 폴리곤 장축각 θ로 이미지를 회전(BORDER_REPLICATE)해 수평화 후 crop.
+    matched & (rotate=="all" or angle_reliable) → 폴리곤 장축각 θ로 이미지를 회전
+    (BORDER_REPLICATE)해 수평화 후 crop.
     그 외 → 회전 없이 GT bbox 중심에서 crop (manifest↔실제 파일 크기 다르면 스케일 보정).
+
+    rotate: "all"(기본, 매칭 알약 전부 회전) | "reliable"(angle_reliable 만 회전, 이전 정책)
 
     반환: (crop, {rotated, angle_used, mode, side|w|h, center})
     """
@@ -147,7 +154,7 @@ def upright_crop(img: np.ndarray, row, mode: str = "square", margin: float = 1.3
     matched = _as_bool(row.get("matched"))
     reliable = _as_bool(row.get("angle_reliable"))
     pred_cx = row.get("pred_cx")
-    use_pred = matched and reliable and pred_cx is not None and not (
+    use_pred = matched and (rotate == "all" or reliable) and pred_cx is not None and not (
         isinstance(pred_cx, float) and math.isnan(pred_cx))
 
     if use_pred:
@@ -238,7 +245,8 @@ def _iter_progress(seq, total):
 
 
 def run_split(df: pd.DataFrame, lut: dict, out_root: Path, split: str,
-              mode: str, margin: float, only_reliable: bool, viz_n: int) -> None:
+              mode: str, margin: float, only_reliable: bool, viz_n: int,
+              rotate: str = "all") -> None:
     import cv2
     sub = df[df["split"] == split] if "split" in df.columns else df
     if only_reliable:
@@ -256,7 +264,7 @@ def run_split(df: pd.DataFrame, lut: dict, out_root: Path, split: str,
         if img is None:
             n_miss += 1
             continue
-        crop, meta = upright_crop(img, r, mode=mode, margin=margin)
+        crop, meta = upright_crop(img, r, mode=mode, margin=margin, rotate=rotate)
         if crop is None or crop.size == 0:
             n_miss += 1
             continue
@@ -298,6 +306,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--margin", type=float, default=1.3, help="crop 여백 배수")
     p.add_argument("--only-reliable", action="store_true",
                    help="angle_reliable 행만 처리(OCR 팀이 회전된 것만 원할 때)")
+    p.add_argument("--rotate", choices=["all", "reliable"], default="all",
+                   help="all=매칭 알약 전부 회전(기본, 로직 단일화) / reliable=angle_reliable만")
     p.add_argument("--viz-samples", type=int, default=12)
     return p.parse_args()
 
@@ -308,10 +318,10 @@ def main():
     df = load_obb_manifest(args.manifest)
     lut = ensure_images(args.images, args.out / "_raw")
     print(f"[upright] mode={args.mode} margin={args.margin} "
-          f"only_reliable={args.only_reliable}")
+          f"only_reliable={args.only_reliable} rotate={args.rotate}")
     for split in args.split:
         run_split(df, lut, args.out, split, args.mode, args.margin,
-                  args.only_reliable, args.viz_samples)
+                  args.only_reliable, args.viz_samples, args.rotate)
     print(f"[upright] 완료 → {args.out}")
 
 
