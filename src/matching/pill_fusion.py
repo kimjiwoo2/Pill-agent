@@ -117,6 +117,9 @@ GATE_DEFAULTS = {
 
 
 def gate(conf, mode='hard', params=None):
+    if mode == 'calibrated':
+        # g = P̂(판독 정확 | conf) — val에서 isotonic 적합한 경험 곡선 (params 필수)
+        return float(np.interp(conf, params['xs'], params['ys']))
     p = {**GATE_DEFAULTS[mode], **(params or {})}
     if mode == 'hard':
         return 1.0 if conf >= p['thr'] else 0.0
@@ -125,6 +128,27 @@ def gate(conf, mode='hard', params=None):
     if mode == 'linear':
         return float(np.clip((conf - p['lo']) / max(p['hi'] - p['lo'], 1e-9), 0.0, 1.0))
     raise ValueError(mode)
+
+
+def fit_conf_calibration(rows_meta, cand_info):
+    """calibrated gate 곡선 적합: conf → P(판독=정답각인 exact).
+    rows_meta: (gt_seq, faces, conf) — 판독 있는 쿼리만 사용. isotonic 회귀."""
+    from sklearn.isotonic import IsotonicRegression
+    xs, ys = [], []
+    for gt, qf, cf in rows_meta:
+        if not qf:
+            continue
+        info = cand_info.get(gt)
+        if info is None or not info['eng']:
+            continue
+        o = normalize_imprint(qf[0])
+        xs.append(cf)
+        ys.append(1.0 if o and o in info['eng'] else 0.0)
+    iso = IsotonicRegression(increasing=True, out_of_bounds='clip')
+    iso.fit(xs, ys)
+    gx = list(np.linspace(0.0, 1.0, 101))
+    gy = [float(v) for v in iso.predict(gx)]
+    return {'xs': gx, 'ys': gy, 'n_fit': len(xs)}
 
 
 # ============================================================ DB / 후보 캐시
@@ -400,7 +424,8 @@ def evaluate(labels, faces, confs, p_by_id, db, params, ks=(1, 2, 3)):
         qf = faces.get(oid, []); cf = confs.get(oid, 0.0)
         scored = match_fused(qf, cf, cand, pc, ps, cand_info,
                              alpha=params['alpha'], beta=params['beta'], eps=params['eps'],
-                             gate_mode=params['gate_mode'], use_gating=params['use_gating'],
+                             gate_mode=params['gate_mode'], gate_params=params.get('gate_params'),
+                             use_gating=params['use_gating'],
                              use_neutralize=params['use_neutralize'], use_engrave=params['use_engrave'],
                              dual180=params['dual180'], cs_gate=params['cs_gate'], return_scores=True)
         rec_hits = {k: int(in_topk_ties(scored, gt, k)) for k in ks}
@@ -507,7 +532,8 @@ def parse_args():
     p.add_argument('--alpha', type=float, default=2.5)
     p.add_argument('--beta', type=float, default=0.1)
     p.add_argument('--eps', type=float, default=1e-3)
-    p.add_argument('--gate-mode', default='hard', choices=['hard', 'sigmoid', 'linear'])
+    p.add_argument('--gate-mode', default='hard', choices=['hard', 'sigmoid', 'linear', 'calibrated'],
+                   help='calibrated: val에서 conf→정확도 isotonic 곡선을 게이트로 (--fit 전용, sklearn 필요)')
     # 업그레이드 토글
     p.add_argument('--dual180', action='store_true', help='180° 뒤집힘 dual-match (권장)')
     p.add_argument('--cs-gate', action='store_true', help='색·형태에 (1−g) 곱')
@@ -675,6 +701,7 @@ def precompute_features(labels, faces, confs, p_by_id, db, params):
     ci_combo = db['combo_to_items']; cand_info = db['cand_info']
     CC, SC = db['COLOR_CLASSES'], db['SHAPE_CLASSES']
     topk, eps, gate_mode = params['topk_combo'], params['eps'], params['gate_mode']
+    gp = params.get('gate_params')
     rows, miss = [], 0
     for r in labels:
         oid, gt = r['oid'], r['seq']
@@ -684,7 +711,7 @@ def precompute_features(labels, faces, confs, p_by_id, db, params):
         pc, ps = p_by_id[oid]
         cand = compress_candidates(pc, ps, ci_combo, CC, SC, topk)
         qf = faces.get(oid, []); cf = confs.get(oid, 0.0)
-        g = gate(cf, gate_mode)
+        g = gate(cf, gate_mode, gp)
         seqs, F, ptb = [], [], []
         for seq in cand:
             info = cand_info.get(seq)
@@ -797,22 +824,47 @@ def print_report(split, res, topk):
 
 
 def run_fit(args, labels, faces, confs, p_by_id, db, params):
-    """새 식 적합: 2-fold CV(정직한 val 성능) → 전체 적합 → 가중치 JSON 저장."""
+    """새 식 적합: 2-fold CV(정직한 val 성능) → 전체 적합 → 가중치 JSON 저장.
+    gate_mode=calibrated 면 fold별로 게이트 곡선도 fold-train에서만 적합 (무누수)."""
     import json
-    print(f"\n[fit] 새 식 피처 캐시 생성 (WED+dual180, gate={params['gate_mode']}) …")
-    rows, miss = precompute_features(labels, faces, confs, p_by_id, db, params)
-    print(f"[fit] 쿼리 {len(rows)} (crop없음 {miss}) · 후보풀 내 정답 "
-          f"{sum(1 for r in rows if r['gt_idx'] >= 0)}/{len(rows)}")
+    calibrated = params['gate_mode'] == 'calibrated'
 
-    # ── 2-fold CV: oid 정렬 후 짝/홀 — 결정적 분할, fold-밖 평가만 보고 ──
-    order = sorted(range(len(rows)), key=lambda i: rows[i]['label']['oid'])
-    fold = [[rows[i] for k, i in enumerate(order) if k % 2 == p] for p in (0, 1)]
-    cv = []
-    for tr, te, name in [(fold[0], fold[1], 'fold1→2'), (fold[1], fold[0], 'fold2→1')]:
-        w, nfit = fit_conditional_logit(tr)
-        m = evaluate_learned(te, w, params['topk_combo'])['all']
-        cv.append(m)
-        print(f"[fit][CV {name}] 적합 {nfit}쿼리 → 밖 R@1={m['recall@1']:.4f} R@3={m['recall@3']:.4f}")
+    def meta_of(lab_subset):
+        return [(r['seq'], faces.get(r['oid'], []), confs.get(r['oid'], 0.0)) for r in lab_subset]
+
+    # ── 분할은 라벨(oid) 기준으로 먼저 확정 — calibrated 피처가 fold별로 달라져도 동일 분할 ──
+    lab_eval = [r for r in labels if r['oid'] in p_by_id]
+    order = sorted(range(len(lab_eval)), key=lambda i: lab_eval[i]['oid'])
+    lfold = [[lab_eval[i] for k, i in enumerate(order) if k % 2 == p] for p in (0, 1)]
+
+    if calibrated:
+        print("\n[fit] calibrated gate — fold-train에서 conf→정확도 isotonic 곡선 적합 (무누수)")
+        cv = []
+        for tr_lab, te_lab, name in [(lfold[0], lfold[1], 'fold1→2'), (lfold[1], lfold[0], 'fold2→1')]:
+            gp = fit_conf_calibration(meta_of(tr_lab), db['cand_info'])
+            pf_ = {**params, 'gate_params': gp}
+            tr, _ = precompute_features(tr_lab, faces, confs, p_by_id, db, pf_)
+            te, _ = precompute_features(te_lab, faces, confs, p_by_id, db, pf_)
+            w, nfit = fit_conditional_logit(tr)
+            m = evaluate_learned(te, w, params['topk_combo'])['all']
+            cv.append(m)
+            print(f"[fit][CV {name}] gate적합 {gp['n_fit']} · w적합 {nfit} → 밖 R@1={m['recall@1']:.4f} R@3={m['recall@3']:.4f}")
+        gp_full = fit_conf_calibration(meta_of(lab_eval), db['cand_info'])
+        params = {**params, 'gate_params': gp_full}
+        rows, miss = precompute_features(lab_eval, faces, confs, p_by_id, db, params)
+    else:
+        print(f"\n[fit] 새 식 피처 캐시 생성 (WED+dual180, gate={params['gate_mode']}) …")
+        rows, miss = precompute_features(labels, faces, confs, p_by_id, db, params)
+        print(f"[fit] 쿼리 {len(rows)} (crop없음 {miss}) · 후보풀 내 정답 "
+              f"{sum(1 for r in rows if r['gt_idx'] >= 0)}/{len(rows)}")
+        order = sorted(range(len(rows)), key=lambda i: rows[i]['label']['oid'])
+        fold = [[rows[i] for k, i in enumerate(order) if k % 2 == p] for p in (0, 1)]
+        cv = []
+        for tr, te, name in [(fold[0], fold[1], 'fold1→2'), (fold[1], fold[0], 'fold2→1')]:
+            w, nfit = fit_conditional_logit(tr)
+            m = evaluate_learned(te, w, params['topk_combo'])['all']
+            cv.append(m)
+            print(f"[fit][CV {name}] 적합 {nfit}쿼리 → 밖 R@1={m['recall@1']:.4f} R@3={m['recall@3']:.4f}")
     cv_r1 = float(np.mean([m['recall@1'] for m in cv]))
     cv_r3 = float(np.mean([m['recall@3'] for m in cv]))
     print(f"[fit] ★ val 2-fold CV: R@1={cv_r1:.4f} R@3={cv_r3:.4f}  ← 새 식의 정직한 val 성능")
@@ -825,8 +877,9 @@ def run_fit(args, labels, faces, confs, p_by_id, db, params):
     res_tr = evaluate_learned(rows, w_full, params['topk_combo'])
     print(f"[fit] (참고) 적합데이터 자체 R@3={res_tr['all']['recall@3']:.4f} — 낙관치, 보고엔 CV 사용")
 
+    gp_save = params.get('gate_params') or GATE_DEFAULTS.get(params['gate_mode'])
     out = dict(w=[float(v) for v in w_full], feat_names=list(FEAT_NAMES),
-               gate_mode=params['gate_mode'], gate_params=GATE_DEFAULTS[params['gate_mode']],
+               gate_mode=params['gate_mode'], gate_params=gp_save,
                eps=params['eps'], topk_combo=params['topk_combo'],
                confusion_groups=list(CONFUSION_GROUPS), sub_cost=0.35,
                fitted_on=args.split, n_fit_queries=nfit,
@@ -843,14 +896,16 @@ def run_apply_weights(args, labels, faces, confs, p_by_id, db, params):
     with open(args.weights, 'r') as f:
         wj = json.load(f)
     assert list(wj['feat_names']) == list(FEAT_NAMES), "가중치 JSON 피처 불일치 — 코드 버전 확인"
-    # fit↔apply 상수 skew 가드: WED 혼동쌍·치환비용·gate 임계값이 적합 시점과 같아야 함
+    # fit↔apply 상수 skew 가드: WED 혼동쌍·치환비용이 적합 시점과 같아야 함
     assert list(wj.get('confusion_groups', CONFUSION_GROUPS)) == list(CONFUSION_GROUPS), \
         "CONFUSION_GROUPS 가 적합 시점과 다름 — 재적합 필요"
     assert abs(wj.get('sub_cost', 0.35) - 0.35) < 1e-12, "WED 치환비용이 적합 시점과 다름"
-    if 'gate_params' in wj:
+    if wj['gate_mode'] != 'calibrated' and 'gate_params' in wj:
         assert wj['gate_params'] == GATE_DEFAULTS[wj['gate_mode']], \
             "gate 파라미터가 적합 시점과 다름 — 재적합 필요"
-    params = {**params, 'gate_mode': wj['gate_mode'], 'eps': wj['eps'], 'topk_combo': wj['topk_combo']}
+    # gate 설정은 JSON에 저장된 것을 그대로 사용 (calibrated 곡선 포함)
+    params = {**params, 'gate_mode': wj['gate_mode'], 'eps': wj['eps'],
+              'topk_combo': wj['topk_combo'], 'gate_params': wj.get('gate_params')}
     w = np.array(wj['w'])
     print(f"\n[apply] 새 식 (fitted_on={wj['fitted_on']}, CV R@3={wj.get('cv_recall3', float('nan')):.4f}) "
           f"gate={params['gate_mode']} combo{params['topk_combo']}")
