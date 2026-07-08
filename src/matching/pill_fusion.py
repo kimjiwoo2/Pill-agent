@@ -1,12 +1,16 @@
 """
 Pill 매칭 fusion — retrieval(색·형태 압축) + rerank(각인 CER) — val/test 공용 .py.
 
-05_jw_cv_pipeline 노트북의 fusion 을 .py 로 이식 + 업그레이드.
+05_jw_cv_pipeline 노트북의 fusion 을 .py 로 이식 + 새 식 적합/평가.
   구식 재현:  --legacy       → 노트북 그대로 (α·g·(−CER) + β·(logP_c+logP_s))
-  업그레이드: 기본 활성 옵션
-    · --dual180   : 각인 매칭에 180° 뒤집힘 dual-match (min CER) — 회전 미보정 흡수
-    · --cs-gate   : 색·형태 항에 (1−g(conf)) 곱 — OCR 강할 때 색·형태 죽여 각인 지배
-    · --fit logreg: α·β·(w_c·w_s) 를 val 라벨로 로지스틱회귀 학습(grid 대체, 초~분)
+  중간 토글:  --dual180 / --cs-gate / --grid (α/β 격자) — ablation 용
+  ★ 새 식:   --fit logreg  → val에서 새 식 가중치 적합 (2-fold CV 보고 + 전체적합 JSON 저장)
+             --weights W.json → 적합된 새 식으로 평가 (val/test 공용)
+    새 식:  score(d) = w·f(q,d),  f = [ g·s_wed, g·s_wed·L̂, g·1[비각인],
+                                        (1−g)·logP_c, (1−g)·logP_s, g·logP_c, g·logP_s ]
+      · s_wed = 1 − WED(ocr, eng_d): 혼동쌍(O↔0,I↔1,B↔8…) 치환 0.35 + 180° dual-match
+      · L̂ 항 = 길이편향 보정(짧은 각인 우연일치 억제 — LLR의 학습형)
+      · w 7개 = 조건부 로지스틱 회귀(convex)로 val 적합, test엔 동결 적용
 
 입력 (경로는 전부 인자):
   --drug-master-csv : object 아님, drug_master 덤프 CSV (item_seq, color_class1, drug_shape, print_front/back)
@@ -505,6 +509,11 @@ def parse_args():
     p.add_argument('--cs-gate', action='store_true', help='색·형태에 (1−g) 곱')
     p.add_argument('--legacy', action='store_true', help='노트북 그대로 재현(dual180·cs_gate 끔)')
     p.add_argument('--grid', action='store_true', help='val에서 α/β 격자 탐색 → best 리포트')
+    # 새 식 (WED + 조건부 로짓)
+    p.add_argument('--fit', choices=['logreg'], default=None,
+                   help='새 식 가중치 적합 (val에서): 2-fold CV 보고 + 전체적합 JSON 저장')
+    p.add_argument('--weights', default=None, help='적합된 가중치 JSON 으로 평가 (val/test)')
+    p.add_argument('--weights-out', default='fusion_weights.json', help='--fit 저장 경로')
     p.add_argument('--limit', type=int, default=0, help='스모크 테스트: 앞 N건만 평가 (0=전체)')
     return p.parse_args()
 
@@ -589,6 +598,256 @@ def run_grid(labels, faces, confs, p_by_id, db, params,
     return ba, bb
 
 
+# ============================================================ 새 식: WED + 조건부 로짓 적합
+# 시각 혼동쌍(OCR 이 자주 바꿔 읽는 글자) — 치환비용 0.35 (일반 치환 1.0)
+CONFUSION_GROUPS = ('O0Q', 'I1L', 'B8', 'S5', 'Z2', 'G6', 'A4', 'UV')
+_CONF_COST = {}
+for _grp in CONFUSION_GROUPS:
+    for _a in _grp:
+        for _b in _grp:
+            if _a != _b:
+                _CONF_COST[(_a, _b)] = 0.35
+
+
+def wed(pred, target):
+    """가중 편집거리 / len(target). 혼동쌍 치환 0.35, 일반 치환·삽입·삭제 1.0."""
+    p, t = list(pred), list(target)
+    dp = [float(j) for j in range(len(t) + 1)]
+    for pc in p:
+        ndp = [dp[0] + 1.0]
+        for j, tc in enumerate(t):
+            sub = 0.0 if pc == tc else _CONF_COST.get((pc, tc), 1.0)
+            ndp.append(min(dp[j] + sub, dp[j + 1] + 1.0, ndp[-1] + 1.0))
+        dp = ndp
+    return dp[len(t)] / max(len(t), 1)
+
+
+def best_imprint(query_faces, engs):
+    """쿼리 각인들 vs 후보 각인들 → (최고 s=1−WED, 그 각인 길이). 180° dual 포함. 없으면 None."""
+    best = None
+    for q0 in query_faces:
+        q = normalize_imprint(q0)
+        if not q:
+            continue
+        variants = [q]
+        qr = rot180(q)
+        if qr is not None:
+            variants.append(qr)
+        for e in engs:
+            for v in variants:
+                s = max(0.0, 1.0 - wed(v, e))
+                if best is None or s > best[0]:
+                    best = (s, len(e))
+    return best
+
+
+FEAT_NAMES = ('g*s_wed', 'g*s_wed*len', 'g*noeng',
+              '(1-g)*logPc', '(1-g)*logPs', 'g*logPc', 'g*logPs')
+
+
+def cand_features(qf, g, pc, ps, info, eps):
+    """새 식의 후보별 피처 벡터 f(q,d) — score = w·f."""
+    ci, si, eng = info['ci'], info['si'], info['eng']
+    lpc = np.log((pc[ci] if ci is not None else 0.0) + eps)
+    lps = np.log((ps[si] if si is not None else 0.0) + eps)
+    f = np.zeros(len(FEAT_NAMES))
+    if eng:
+        bm = best_imprint(qf, eng)
+        if bm is not None:
+            s, L = bm
+            f[0] = g * s
+            f[1] = g * s * min(L, 8) / 8.0     # 길이편향 보정: 긴 각인 일치 = 더 강한 증거
+    else:
+        f[2] = g                                # 비각인 후보 (쿼리 미판독이면 conf=0→g=0→중립)
+    f[3] = (1.0 - g) * lpc
+    f[4] = (1.0 - g) * lps
+    f[5] = g * lpc
+    f[6] = g * lps
+    return f
+
+
+def precompute_features(labels, faces, confs, p_by_id, db, params):
+    """쿼리별 (후보 피처행렬, GT 위치, 슬라이스 메타) 캐시 — 적합·평가 공용."""
+    ci_combo = db['combo_to_items']; cand_info = db['cand_info']
+    CC, SC = db['COLOR_CLASSES'], db['SHAPE_CLASSES']
+    topk, eps, gate_mode = params['topk_combo'], params['eps'], params['gate_mode']
+    rows, miss = [], 0
+    for r in labels:
+        oid, gt = r['oid'], r['seq']
+        if oid not in p_by_id:
+            miss += 1
+            continue
+        pc, ps = p_by_id[oid]
+        cand = compress_candidates(pc, ps, ci_combo, CC, SC, topk)
+        qf = faces.get(oid, []); cf = confs.get(oid, 0.0)
+        g = gate(cf, gate_mode)
+        seqs, F, ptb = [], [], []
+        for seq in cand:
+            info = cand_info.get(seq)
+            if info is None:
+                continue
+            seqs.append(seq)
+            F.append(cand_features(qf, g, pc, ps, info, eps))
+            ptb.append((pc[info['ci']] if info['ci'] is not None else 0.0)
+                       + (ps[info['si']] if info['si'] is not None else 0.0))
+        rows.append(dict(label=r, read=bool(qf), seqs=seqs,
+                         F=np.array(F) if F else np.zeros((0, len(FEAT_NAMES))),
+                         ptb=np.array(ptb),
+                         gt_idx=seqs.index(gt) if gt in seqs else -1,
+                         in_dm=gt in cand_info))
+    return rows, miss
+
+
+def fit_conditional_logit(rows, l2=1e-3):
+    """조건부 로짓(listwise softmax) MLE — convex, 초 단위.
+    P(d*|q) = softmax(F@w)[gt] 를 최대화. GT가 후보풀에 있는 쿼리만 적합에 사용."""
+    from scipy.optimize import minimize
+    fit_rows = [(r['gt_idx'], r['F']) for r in rows if r['gt_idx'] >= 0 and len(r['seqs']) > 1]
+
+    def obj(w):
+        nll = l2 * float(w @ w)
+        grad = 2.0 * l2 * w.copy()
+        for gt_idx, F in fit_rows:
+            z = F @ w
+            z = z - z.max()
+            e = np.exp(z)
+            p = e / e.sum()
+            nll -= float(np.log(max(p[gt_idx], 1e-300)))
+            grad += F.T @ p - F[gt_idx]
+        return nll, grad
+
+    res = minimize(obj, np.zeros(len(FEAT_NAMES)), jac=True, method='L-BFGS-B',
+                   options={'maxiter': 500})
+    return res.x, len(fit_rows)
+
+
+def evaluate_learned(rows, w, topk, ks=(1, 2, 3)):
+    """새 식(w·f) 평가 — evaluate() 와 동일 슬라이스/공동순위 채점."""
+    from collections import defaultdict
+    covkey = 'coverage@%d' % topk
+
+    def new_acc():
+        return {'n': 0, 'cov': 0, 'read': 0, 'rec': {k: 0 for k in ks}}
+    sl = defaultdict(new_acc)
+    per_color_tot, per_color_cov = {}, {}
+
+    def bump(acc, hit_cov, has_read, rec_hits):
+        acc['n'] += 1; acc['cov'] += int(hit_cov); acc['read'] += int(has_read)
+        for k in ks:
+            acc['rec'][k] += rec_hits[k]
+
+    for row in rows:
+        r = row['label']
+        hit_cov = row['gt_idx'] >= 0
+        if len(row['seqs']):
+            z = row['F'] @ w
+            scored = sorted(zip(z, row['ptb'], row['seqs']), key=lambda x: (x[0], x[1]), reverse=True)
+            ranked = [(seq, sc) for sc, tb, seq in scored]
+        else:
+            ranked = []
+        rec_hits = {k: int(in_topk_ties(ranked, r['seq'], k)) for k in ks}
+        bump(sl['all'], hit_cov, row['read'], rec_hits)
+        if r.get('seen') is True:
+            bump(sl['seen'], hit_cov, row['read'], rec_hits)
+        elif r.get('seen') is False:
+            bump(sl['unseen'], hit_cov, row['read'], rec_hits)
+        if r.get('printed') is True:
+            bump(sl['printed'], hit_cov, row['read'], rec_hits)
+        elif r.get('printed') is False:
+            bump(sl['no_print'], hit_cov, row['read'], rec_hits)
+        per_color_tot[r['color']] = per_color_tot.get(r['color'], 0) + 1
+        per_color_cov[r['color']] = per_color_cov.get(r['color'], 0) + int(hit_cov)
+
+    def summ(acc):
+        n = max(acc['n'], 1)
+        o = {'n': acc['n'], covkey: acc['cov'] / n, 'read_rate': acc['read'] / n}
+        for k in ks:
+            o['recall@%d' % k] = acc['rec'][k] / n
+        o['reach@3'] = o['recall@3'] / max(o[covkey], 1e-9)
+        return o
+
+    out = {s: summ(a) for s, a in sl.items()}
+    out['_per_color'] = {c: per_color_cov[c] / per_color_tot[c] for c in per_color_tot}
+    out['_pool'] = {'in_pool': sum(1 for x in rows if x.get('in_dm')),
+                    'evaluated': sl['all']['n'], 'miss_crop': 0}
+    return out
+
+
+def print_report(split, res, topk):
+    covk = 'coverage@%d' % topk
+    pool = res['_pool']
+    print("\n" + "=" * 60)
+    print(f"[{split}]  평가 {pool['evaluated']}건 · crop없음 {pool['miss_crop']} · "
+          f"후보풀 내 정답 {pool['in_pool']}/{pool['evaluated']} (coverage 천장)")
+    print(f"{'slice':<10}{'n':>6}{'판독':>7}{'cov':>8}{'R@1':>8}{'R@2':>8}{'R@3':>8}{'reach@3':>9}")
+    print("-" * 60)
+    for name in ['all', 'seen', 'unseen', 'printed', 'no_print']:
+        if name not in res:
+            continue
+        r = res[name]
+        print(f"{name:<10}{r['n']:>6}{r['read_rate']:>7.2f}{r[covk]:>8.3f}"
+              f"{r['recall@1']:>8.3f}{r['recall@2']:>8.3f}{r['recall@3']:>8.3f}{r['reach@3']:>9.3f}")
+    print("-" * 60)
+    print("색별 coverage:", {c: round(v, 3) for c, v in sorted(res['_per_color'].items(), key=lambda x: -x[1])})
+    print("=" * 60)
+
+
+def run_fit(args, labels, faces, confs, p_by_id, db, params):
+    """새 식 적합: 2-fold CV(정직한 val 성능) → 전체 적합 → 가중치 JSON 저장."""
+    import json
+    print(f"\n[fit] 새 식 피처 캐시 생성 (WED+dual180, gate={params['gate_mode']}) …")
+    rows, miss = precompute_features(labels, faces, confs, p_by_id, db, params)
+    print(f"[fit] 쿼리 {len(rows)} (crop없음 {miss}) · 후보풀 내 정답 "
+          f"{sum(1 for r in rows if r['gt_idx'] >= 0)}/{len(rows)}")
+
+    # ── 2-fold CV: oid 정렬 후 짝/홀 — 결정적 분할, fold-밖 평가만 보고 ──
+    order = sorted(range(len(rows)), key=lambda i: rows[i]['label']['oid'])
+    fold = [[rows[i] for k, i in enumerate(order) if k % 2 == p] for p in (0, 1)]
+    cv = []
+    for tr, te, name in [(fold[0], fold[1], 'fold1→2'), (fold[1], fold[0], 'fold2→1')]:
+        w, nfit = fit_conditional_logit(tr)
+        m = evaluate_learned(te, w, params['topk_combo'])['all']
+        cv.append(m)
+        print(f"[fit][CV {name}] 적합 {nfit}쿼리 → 밖 R@1={m['recall@1']:.4f} R@3={m['recall@3']:.4f}")
+    cv_r1 = float(np.mean([m['recall@1'] for m in cv]))
+    cv_r3 = float(np.mean([m['recall@3'] for m in cv]))
+    print(f"[fit] ★ val 2-fold CV: R@1={cv_r1:.4f} R@3={cv_r3:.4f}  ← 새 식의 정직한 val 성능")
+
+    # ── 전체 적합 → test 용 동결 가중치 ──
+    w_full, nfit = fit_conditional_logit(rows)
+    print(f"\n[fit] 전체 적합({nfit}쿼리) 가중치:")
+    for name, v in zip(FEAT_NAMES, w_full):
+        print(f"    {name:<14} {v:>9.4f}")
+    res_tr = evaluate_learned(rows, w_full, params['topk_combo'])
+    print(f"[fit] (참고) 적합데이터 자체 R@3={res_tr['all']['recall@3']:.4f} — 낙관치, 보고엔 CV 사용")
+
+    out = dict(w=[float(v) for v in w_full], feat_names=list(FEAT_NAMES),
+               gate_mode=params['gate_mode'], eps=params['eps'],
+               topk_combo=params['topk_combo'], confusion_groups=list(CONFUSION_GROUPS),
+               fitted_on=args.split, n_fit_queries=nfit,
+               cv_recall1=cv_r1, cv_recall3=cv_r3)
+    with open(args.weights_out, 'w') as f:
+        json.dump(out, f, indent=1)
+    print(f"[fit] 가중치 저장 → {args.weights_out}")
+    print(f"[fit] → test:  --split test --weights {args.weights_out} (labels/ocr/crops 만 test 로)")
+
+
+def run_apply_weights(args, labels, faces, confs, p_by_id, db, params):
+    """적합된 새 식(JSON)으로 평가 — val 재확인 or test 최종."""
+    import json
+    with open(args.weights, 'r') as f:
+        wj = json.load(f)
+    assert list(wj['feat_names']) == list(FEAT_NAMES), "가중치 JSON 피처 불일치 — 코드 버전 확인"
+    params = {**params, 'gate_mode': wj['gate_mode'], 'eps': wj['eps'], 'topk_combo': wj['topk_combo']}
+    w = np.array(wj['w'])
+    print(f"\n[apply] 새 식 (fitted_on={wj['fitted_on']}, CV R@3={wj.get('cv_recall3', float('nan')):.4f}) "
+          f"gate={params['gate_mode']} combo{params['topk_combo']}")
+    rows, miss = precompute_features(labels, faces, confs, p_by_id, db, params)
+    res = evaluate_learned(rows, w, params['topk_combo'])
+    res['_pool']['miss_crop'] = miss
+    print_report(args.split, res, params['topk_combo'])
+
+
 def main():
     args = parse_args()
     if args.legacy:
@@ -607,6 +866,12 @@ def main():
     p_by_id = infer_probs(args, object_ids)
     faces, confs = load_ocr(args, object_ids)
 
+    if args.fit:
+        run_fit(args, labels, faces, confs, p_by_id, db, params)
+        return
+    if args.weights:
+        run_apply_weights(args, labels, faces, confs, p_by_id, db, params)
+        return
     if args.grid:
         run_grid(labels, faces, confs, p_by_id, db, params)
         return
