@@ -228,7 +228,7 @@ def infer_probs(args, object_ids):
     tf = transforms.Compose([Letterbox(224, 128), transforms.ToTensor(),
                              transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
 
-    crop_dir = _ensure_crops(args.crops)
+    crop_lut = _ensure_crops(args.crops)
     pcs, pss, miss = [], [], 0
     batch, ids_ok = [], []
 
@@ -245,8 +245,8 @@ def infer_probs(args, object_ids):
 
     p_by_id = {}
     for oid in object_ids:
-        fp = os.path.join(crop_dir, f"{oid}.png")
-        if not os.path.exists(fp):
+        fp = crop_lut.get(oid)
+        if fp is None:
             miss += 1
             continue
         batch.append(tf(Image.open(fp).convert('RGB')))
@@ -263,17 +263,23 @@ def infer_probs(args, object_ids):
 
 
 def _ensure_crops(crops):
+    """crop 폴더/zip → {object_id: png경로} LUT.
+    zip은 zip 이름별 폴더에 풂 (val/test 같은 폴더 재사용으로 인한 crop 오염 방지).
+    중첩 폴더(zip 안 crops_test/ 등)도 rglob 으로 흡수."""
     p = Path(crops)
     if p.is_dir():
-        return str(p)
-    out = Path('/tmp/pill_crops') if not os.path.exists('/content') else Path('/content/pill_crops')
-    out.mkdir(parents=True, exist_ok=True)
-    if not any(out.glob('*.png')):
-        print(f"[crops] 압축 해제: {p.name}")
-        with zipfile.ZipFile(p) as zf:
-            zf.extractall(out)
-    hits = list(out.rglob('*.png'))
-    return str(hits[0].parent) if hits else str(out)
+        root = p
+    else:
+        base = Path('/content/pill_crops') if os.path.exists('/content') else Path('/tmp/pill_crops')
+        root = base / p.stem                      # zip별 격리: pill_crops/crop_v7_val, .../test_filtered
+        root.mkdir(parents=True, exist_ok=True)
+        if not any(root.rglob('*.png')):
+            print(f"[crops] 압축 해제: {p.name} → {root}")
+            with zipfile.ZipFile(p) as zf:
+                zf.extractall(root)
+    lut = {q.stem: q for q in root.rglob('*.png')}
+    print(f"[crops] {len(lut):,}장 인덱싱: {root}")
+    return lut
 
 
 # ============================================================ 압축 (retrieval)
@@ -422,7 +428,7 @@ def evaluate(labels, faces, confs, p_by_id, db, params, ks=(1, 2, 3)):
 def _as_bool(v):
     if pd.isna(v):
         return None
-    return str(v).strip().lower() in ('1', 'true', 't', 'yes', 'y')
+    return str(v).strip().lower() in ('1', '1.0', 'true', 't', 'yes', 'y')
 
 
 def load_labels(args):
@@ -448,8 +454,9 @@ def load_labels(args):
 
 
 def load_ocr(args, object_ids):
-    df = pd.read_csv(args.ocr_csv, low_memory=False).set_index('object_id')
-    df.index = df.index.astype(str)
+    df = pd.read_csv(args.ocr_csv, low_memory=False)
+    df['object_id'] = df['object_id'].astype(str)
+    df = df.drop_duplicates('object_id', keep='first').set_index('object_id')
     faces, confs = {}, {}
     for oid in object_ids:
         if oid in df.index:
@@ -461,7 +468,13 @@ def load_ocr(args, object_ids):
             txt, cf = '', 0.0
         faces[oid] = [txt] if txt else []
         confs[oid] = cf
-    print(f"[ocr] {args.ocr_csv} · 판독성공 {sum(1 for v in faces.values() if v)}/{len(object_ids)}")
+    # OCR 일관성 진단: val/test 가 같은 OCR 모델인지 통계로 드러냄
+    #   (ft 모델 혼입 시 conf≈1.0 몰림 + gate 통과율 급등 → 즉시 티 남)
+    cv = np.array([confs[o] for o in object_ids])
+    n_read = sum(1 for o in object_ids if faces[o])
+    print(f"[ocr] {Path(args.ocr_csv).name} · 판독 {n_read}/{len(object_ids)} ({n_read/max(len(object_ids),1):.3f})"
+          f" · conf 평균 {cv.mean():.3f} · conf>0.99 {(cv > 0.99).mean():.3f}"
+          f" · hard-gate(0.8) 통과 {(cv >= 0.8).mean():.3f}")
     return faces, confs
 
 
@@ -491,6 +504,7 @@ def parse_args():
     p.add_argument('--dual180', action='store_true', help='180° 뒤집힘 dual-match (권장)')
     p.add_argument('--cs-gate', action='store_true', help='색·형태에 (1−g) 곱')
     p.add_argument('--legacy', action='store_true', help='노트북 그대로 재현(dual180·cs_gate 끔)')
+    p.add_argument('--limit', type=int, default=0, help='스모크 테스트: 앞 N건만 평가 (0=전체)')
     return p.parse_args()
 
 
@@ -505,6 +519,9 @@ def main():
 
     db = load_drug_master(args)
     labels = load_labels(args)
+    if args.limit > 0:
+        labels = labels[:args.limit]
+        print(f"[smoke] --limit {args.limit} → 앞 {len(labels)}건만 평가")
     object_ids = [r['oid'] for r in labels]
     p_by_id = infer_probs(args, object_ids)
     faces, confs = load_ocr(args, object_ids)
