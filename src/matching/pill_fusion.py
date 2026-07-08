@@ -490,11 +490,16 @@ def load_ocr(args, object_ids):
     df = pd.read_csv(args.ocr_csv, low_memory=False)
     df['object_id'] = df['object_id'].astype(str)
     df = df.drop_duplicates('object_id', keep='first').set_index('object_id')
+    # 컬럼명 버전 대응: ocr_text (v9) / ocr_text_norm (final v1+)
+    txt_col = next((c for c in ['ocr_text', 'ocr_text_norm', 'ocr_text_raw'] if c in df.columns), None)
+    assert txt_col, f"OCR 텍스트 컬럼 없음 ({args.ocr_csv})"
+    if txt_col != 'ocr_text':
+        print(f"[ocr] 텍스트 컬럼: {txt_col} 사용")
     faces, confs = {}, {}
     for oid in object_ids:
         if oid in df.index:
             r = df.loc[oid]
-            txt = str(r['ocr_text']) if pd.notna(r['ocr_text']) else ''
+            txt = str(r[txt_col]) if pd.notna(r[txt_col]) else ''
             txt = '' if txt.strip().upper() in {'', 'NAN', 'NONE'} else txt
             cf = float(r['ocr_conf']) if pd.notna(r['ocr_conf']) else 0.0
         else:
