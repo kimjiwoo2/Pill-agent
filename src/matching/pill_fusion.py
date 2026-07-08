@@ -504,8 +504,89 @@ def parse_args():
     p.add_argument('--dual180', action='store_true', help='180° 뒤집힘 dual-match (권장)')
     p.add_argument('--cs-gate', action='store_true', help='색·형태에 (1−g) 곱')
     p.add_argument('--legacy', action='store_true', help='노트북 그대로 재현(dual180·cs_gate 끔)')
+    p.add_argument('--grid', action='store_true', help='val에서 α/β 격자 탐색 → best 리포트')
     p.add_argument('--limit', type=int, default=0, help='스모크 테스트: 앞 N건만 평가 (0=전체)')
     return p.parse_args()
+
+
+# ============================================================ grid 파라미터 탐색
+def _precompute(labels, faces, confs, p_by_id, db, params):
+    """α/β 무관 부분(후보별 CER·logP·coverage)을 1회 계산 → 격자 스윕 즉시화.
+    match_fused 와 bit-동일하게: eng_term=α·g·(s−1)=α·g·(−cer), cs=cs_w·β·(logP_c+logP_s)."""
+    ci_combo = db['combo_to_items']; cand_info = db['cand_info']
+    CC, SC = db['COLOR_CLASSES'], db['SHAPE_CLASSES']
+    topk, eps = params['topk_combo'], params['eps']
+    dual180, gate_mode = params['dual180'], params['gate_mode']
+    cache = []
+    for r in labels:
+        oid, gt = r['oid'], r['seq']
+        if oid not in p_by_id:
+            continue
+        pc, ps = p_by_id[oid]
+        cand = compress_candidates(pc, ps, ci_combo, CC, SC, topk)
+        qf = faces.get(oid, []); cf = confs.get(oid, 0.0)
+        g = gate(cf, gate_mode); q_has = any(qf)
+        feats = []
+        for seq in cand:
+            info = cand_info.get(seq)
+            if info is None:
+                continue
+            ci, si, eng = info['ci'], info['si'], info['eng']
+            cer = (1.0 - max((score_one(q, eng, dual180) for q in qf), default=0.0)) if eng else None
+            lpc = np.log(pc[ci] + eps) if ci is not None else np.log(eps)
+            lps = np.log(ps[si] + eps) if si is not None else np.log(eps)
+            ptb = (pc[ci] if ci is not None else 0.0) + (ps[si] if si is not None else 0.0)
+            feats.append((seq, cer, lpc + lps, ptb))
+        cache.append((gt, g, q_has, feats))
+    return cache
+
+
+def _grid_recall(cache, alpha, beta, use_neutralize, cs_gate, ks=(1, 3)):
+    hits = {k: 0 for k in ks}; n = 0
+    for gt, g, q_has, feats in cache:
+        n += 1
+        cs_w = (1.0 - g) if cs_gate else 1.0
+        scored = []
+        for seq, cer, lcs, ptb in feats:
+            if cer is not None:
+                eng_term = alpha * g * (-cer)
+            else:
+                eng_term = (alpha * g * (-1.0) if q_has else 0.0) if use_neutralize else alpha * g * (-1.0)
+            scored.append((eng_term + cs_w * beta * lcs, ptb, seq))
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        ranked = [(seq, sc) for sc, tb, seq in scored]
+        for k in ks:
+            hits[k] += int(in_topk_ties(ranked, gt, k))
+    return {k: hits[k] / max(n, 1) for k in ks}
+
+
+def run_grid(labels, faces, confs, p_by_id, db, params,
+             alphas=(1.5, 2.0, 2.5, 3.0, 4.0), betas=(0.05, 0.1, 0.2, 0.3)):
+    print(f"\n[grid] α×β = {len(alphas)}×{len(betas)} 스윕 "
+          f"(dual180={params['dual180']} cs_gate={params['cs_gate']}) · 추론 캐시 재사용")
+    cache = _precompute(labels, faces, confs, p_by_id, db, params)
+    # 자기검증: fast-path 가 evaluate() 와 정확히 일치해야 (발산 방지)
+    base = _grid_recall(cache, params['alpha'], params['beta'], params['use_neutralize'], params['cs_gate'])
+    ref = evaluate(labels, faces, confs, p_by_id, db, params)['all']['recall@3']
+    assert abs(base[3] - ref) < 1e-12, f"grid fast-path ≠ evaluate ({base[3]} vs {ref})"
+    print(f"[grid] 자기검증 OK (기준 α{params['alpha']}/β{params['beta']} R@3={ref:.4f})")
+
+    rows = []
+    for a in alphas:
+        for b in betas:
+            m = _grid_recall(cache, a, b, params['use_neutralize'], params['cs_gate'])
+            rows.append((a, b, m[1], m[3]))
+    rows.sort(key=lambda x: x[3], reverse=True)
+    print(f"\n{'α':>6}{'β':>8}{'R@1':>9}{'R@3':>9}")
+    print("-" * 32)
+    for a, b, r1, r3 in rows:
+        mark = '  ★ best' if (a, b) == (rows[0][0], rows[0][1]) else ''
+        print(f"{a:>6.2f}{b:>8.3f}{r1:>9.4f}{r3:>9.4f}{mark}")
+    ba, bb = rows[0][0], rows[0][1]
+    tail = ('--dual180 ' if params['dual180'] else '') + ('--cs-gate' if params['cs_gate'] else '')
+    print(f"\n[grid] best: α={ba} β={bb} (val R@3={rows[0][3]:.4f})")
+    print(f"[grid] → test 는 이 값으로:  --alpha {ba} --beta {bb} {tail}".rstrip())
+    return ba, bb
 
 
 def main():
@@ -525,6 +606,10 @@ def main():
     object_ids = [r['oid'] for r in labels]
     p_by_id = infer_probs(args, object_ids)
     faces, confs = load_ocr(args, object_ids)
+
+    if args.grid:
+        run_grid(labels, faces, confs, p_by_id, db, params)
+        return
 
     print(f"\n[config] {'LEGACY' if args.legacy else 'UPGRADE'} · α={args.alpha} β={args.beta} "
           f"gate={args.gate_mode} dual180={args.dual180} cs_gate={args.cs_gate} combo{args.topk_combo}")
