@@ -1,22 +1,23 @@
 """
-pill_e2e.py — 단일 알약 crop → top-k item_seq (e2e 뒷단 ③~⑤)
+pill_e2e.py — PILLiOT end-to-end 모듈 (앞단 YOLO + 뒷단 분류/OCR/fusion)
+
+두 진입점:
+  PillPipeline  : crop 1장 → top-k        (뒷단 ③④⑤. 이미 crop된 알약 입력)
+  ScenePipeline : 원본 씬 → 알약별 top-k  (앞단 ①② + 뒷단. YOLO 검출 포함) ★ 데모용
 
 파이프라인:
-  crop 1장 (YOLO bbox 로 잘린 알약)
-    → ③a Classifier.predict          색·형태 TS 보정 확률
-    → ③b OCRReader.read              각인 raw text + conf  (★ 정규화 안 함)
-    → ④  FusionInferencer.rank       학습된 w 로 재순위    (★ 정규화는 여기 1회)
+  원본 씬
+    → ① YOLO 검출          알약 bbox (축정렬)
+    → ② bbox_crop          margin 1.1 정사각 crop (crop_v7 규격)
+    → ③a Classifier        색·형태 TS 보정 확률
+    → ③b OCRReader         각인 raw text + conf (★ 정규화 안 함)
+    → ④  FusionInferencer  학습된 w 로 재순위 (★ 정규화 1회)
     → ⑤  top-k item_seq
 
 의존:
-  - 주형 pill_fusion.py 를 import (fusion 로직 단일 소스 — 재구현 금지)
-  - 윤수 final_v1 OCR 전처리를 OCRReader 안에 이식 (val 70% 재현의 유일 경로)
-
-설계 원칙:
-  · 3모듈(분류기/OCR/fusion)을 각각 단건 클래스로 분리 → 하나씩 독립 테스트 가능
-  · YOLO 는 이 파일 밖의 crop 공급자. 이 골격이 완성되면 앞에 꽂기만 하면 됨
-  · fusion 계산식은 절대 여기서 재구현하지 않고 pill_fusion 에서 import
-    (주형이 새 CSV로 재fit 해서 weights.json 이 바뀌어도 이 코드는 그대로)
+  - 주형 pill_fusion.py import (fusion 로직 단일 소스)
+  - 윤수 final_v1 OCR 전처리를 OCRReader 에 이식 (val 재현 경로)
+  - YOLO 추론은 ultralytics (앞단, 별도 학습된 best.pt)
 """
 import json
 import pickle
@@ -31,11 +32,6 @@ from torchvision import models, transforms
 import torchvision.transforms.functional as TF
 
 # ── 주형 pill_fusion.py 에서 재사용 (로직 단일 소스) ──
-#   compress_candidates : 색·형태 → 후보 압축 (retrieval)
-#   cand_features       : 후보별 7-피처 (내부에서 best_imprint→normalize_imprint 로 정규화 1회)
-#   gate                : conf → g
-#   FEAT_NAMES          : 피처 순서 (weights.json 정합 검증용)
-#   load_drug_master    : DB → combo_to_items / cand_info / 클래스 목록
 from pill_fusion import (
     compress_candidates,
     cand_features,
@@ -44,11 +40,12 @@ from pill_fusion import (
     load_drug_master,
 )
 
+CROP_MARGIN = 1.1     # crop_v7 규격 (10% 패딩, 정사각). 학습 crop 정합 — 바꾸지 말 것
+
 
 # ============================================================ ③a 분류기 (단건)
 class Classifier:
-    """crop 1장(BGR np.array) → TS 보정 색·형태 확률.
-    네 노트북 cell 17 predict_calibrated + EvalDataset 전처리를 단건으로 이식."""
+    """crop 1장(BGR np.array) → TS 보정 색·형태 확률."""
 
     class _Letterbox:
         def __init__(self, size=224, fill=128):
@@ -103,8 +100,7 @@ class Classifier:
 
     @torch.no_grad()
     def predict(self, crop_bgr):
-        """crop (BGR) → (p_color, p_shape) np.array. 노트북 EvalDataset 전처리와 동일:
-        bilateral filter → RGB → letterbox → normalize."""
+        """crop (BGR) → (p_color, p_shape). bilateral → RGB → letterbox → normalize."""
         arr = cv2.bilateralFilter(crop_bgr, d=3, sigmaColor=15, sigmaSpace=15)
         img = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
         x = self.tf(img).unsqueeze(0).to(self.device)
@@ -116,36 +112,28 @@ class Classifier:
 
 # ============================================================ ③b OCR (단건, raw 반환)
 class OCRReader:
-    """crop 1장(BGR) → (raw_text, conf).  ★ 정규화 안 함 — fusion 내부에서 1회만.
+    """crop 1장(BGR) → (raw_text, conf).  ★ 정규화 안 함 — fusion 내부에서 1회.
+    윤수 final_v1 전처리 이식: load_and_prepare → 12각도 confidence 탐색 → _extract.
 
-    윤수 final_v1 전처리를 그대로 이식(= val 70% 재현의 유일 경로):
-      load_and_prepare → resolve_rotation_by_confidence(12각도 × rotate_only + 180flip)
-                       → _extract_ocr
-
-    mode:
-      'accurate' : 12각도 confidence 탐색 (val 재현. CPU 에서 알약당 수 초~십수 초)
-      'fast'     : 단일 predict (데모 속도용. 정확도 낮음 — 회전 심한 각인에서 손해)
+    mode: 'accurate'(12각도, val 재현, 느림) | 'fast'(단일 predict, 데모 속도용)
     """
 
     def __init__(self, use_gpu=False, mode='accurate', angle_step=30):
         from paddleocr import PaddleOCR, TextDetection
         self.mode = mode
         self.angle_step = angle_step
-        dev = 'gpu' if use_gpu else 'cpu'   # torch 와 GPU 충돌 → 기본 CPU
+        dev = 'gpu' if use_gpu else 'cpu'
 
-        # recognition 파이프라인 (윤수 cell 18 과 동일 설정)
         self.ocr = PaddleOCR(
             device=dev,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=True,
             text_detection_model_name='PP-OCRv5_server_det',
-            text_recognition_model_name='PP-OCRv5_server_rec',   # pretrained (final_v1)
+            text_recognition_model_name='PP-OCRv5_server_rec',
         )
-        # 회전 보정용 detection-only 모델 (윤수 cell 10)
         self.det_model = TextDetection(model_name='PP-OCRv5_server_det')
 
-        # 180° textline orientation (윤수 cell 12) — 없으면 180 보정 스킵
         self._ori = None
         try:
             from paddleocr import TextLineOrientationClassification
@@ -153,7 +141,6 @@ class OCRReader:
         except Exception as e:
             print(f"[OCRReader] textline_ori 로드 실패({e}) — 180 보정 없이 진행")
 
-    # ---- 윤수 전처리 함수 이식 (load_and_prepare 계열) ----
     @staticmethod
     def _preprocess_crop(image_bgr, clahe_clip=2.5, clahe_tile=8,
                          unsharp_strength=1.0, unsharp_sigma=1.5):
@@ -203,7 +190,6 @@ class OCRReader:
         img = self._upscale_if_small(img)
         return img
 
-    # ---- detection 기반 회전(rotate_only) ----
     def _run_detection(self, img):
         result = list(self.det_model.predict(img))
         if not result:
@@ -223,7 +209,6 @@ class OCRReader:
         return theta, L, S
 
     def _rotate_only(self, img):
-        """윤수 final_v1 rotate_only — poly 장축각으로 회전만(크롭 없음)."""
         polys = self._run_detection(img)
         n = len(polys)
         if n == 0:
@@ -275,7 +260,6 @@ class OCRReader:
 
     @staticmethod
     def _extract_raw_conf(page):
-        """page → (raw_text, conf). ★ 정규화 안 함 (raw). 줄/좌표 순 정렬만."""
         texts = [str(t) for t in page.get('rec_texts', [])]
         confs = [float(c) for c in page.get('rec_scores', [])]
         polys = page.get('rec_polys', [])
@@ -290,12 +274,12 @@ class OCRReader:
                            key=lambda x: (round(_cy(x[1]) / row_thresh), _cx(x[1])))
             texts = [t for t, _, _ in items]
             confs = [c for _, _, c in items]
-        raw = ''.join(texts).strip()          # ← raw (정규화 X)
+        raw = ''.join(texts).strip()
         conf = float(np.mean(confs)) if confs else float('nan')
         return raw, conf
 
     def read(self, crop_bgr):
-        """crop(BGR) → (raw_text, conf).  raw_text 는 정규화 전 원문."""
+        """crop(BGR) → (raw_text, conf). raw_text 는 정규화 전 원문."""
         base = self._load_and_prepare(crop_bgr)
 
         if self.mode == 'fast':
@@ -305,7 +289,6 @@ class OCRReader:
             raw, conf = self._extract_raw_conf(res[0])
             return raw, (0.0 if np.isnan(conf) else conf)
 
-        # accurate: 12각도 confidence 탐색 (윤수 resolve_rotation_by_confidence)
         best_conf, best_page = -1.0, None
         for angle in range(0, 360, self.angle_step):
             rimg = self._rotate_image(base, angle) if angle else base
@@ -317,7 +300,7 @@ class OCRReader:
             raw, conf = self._extract_raw_conf(res[0])
             if not np.isnan(conf) and conf > best_conf:
                 best_conf, best_page = conf, res[0]
-        if best_page is None:                  # 12각도 전부 실패 → 전체 crop 마지막 시도
+        if best_page is None:
             res = self.ocr.predict(base, text_det_thresh=0.3)
             if not res:
                 return '', 0.0
@@ -328,13 +311,11 @@ class OCRReader:
 
 # ============================================================ ④ Fusion (단건, 학습 w)
 class FusionInferencer:
-    """학습된 새식 w(weights.json) 로드 → 단건 재순위.
-    정규화는 cand_features 내부 best_imprint 에서 1회만 (이중정규화 방지)."""
+    """학습된 새식 w(weights.json) 로드 → 단건 재순위."""
 
     def __init__(self, weights_json, db):
         with open(weights_json) as f:
             wj = json.load(f)
-        # fit↔infer 계약 검증 (주형 run_apply_weights 의 가드 이식)
         assert list(wj['feat_names']) == list(FEAT_NAMES), "피처 불일치 — pill_fusion 버전 확인"
         self.w = np.array(wj['w'])
         self.gate_mode = wj['gate_mode']
@@ -346,12 +327,10 @@ class FusionInferencer:
         self.SC = db['SHAPE_CLASSES']
 
     def rank(self, p_color, p_shape, ocr_raw_text, ocr_conf, k=3):
-        """색·형태 확률 + OCR raw 각인/conf → [(item_seq, score), ...] 상위 k."""
         cand = compress_candidates(p_color, p_shape, self.combo_to_items,
                                    self.CC, self.SC, self.topk_combo)
         if not cand:
             return []
-        # raw 텍스트를 그대로 qf 로 (정규화는 cand_features→best_imprint 에서)
         txt = '' if str(ocr_raw_text).strip().upper() in {'', 'NAN', 'NONE'} else str(ocr_raw_text)
         qf = [txt] if txt else []
         g = gate(ocr_conf, self.gate_mode)
@@ -370,9 +349,47 @@ class FusionInferencer:
         return [(seq, sc) for sc, tb, seq in scored[:k]]
 
 
-# ============================================================ 뒷단 파이프라인 (③~⑤)
+# ============================================================ ① 검출 (YOLO, 단건)
+class Detector:
+    """원본 씬(BGR) → 알약 bbox 리스트. 다른 모듈처럼 로드·추론 분리.
+    축정렬 bbox (OBB 아님) — 학습된 yolo11n best.pt 사용."""
+
+    def __init__(self, yolo_pt):
+        from ultralytics import YOLO
+        self.model = YOLO(yolo_pt)
+        print(f"[Detector] YOLO 로드: {yolo_pt}")
+
+    def detect(self, scene_bgr, conf_thres=0.25):
+        """씬 → [(cx, cy, bw, bh, det_conf), ...] 픽셀 좌표."""
+        res = self.model.predict(scene_bgr, conf=conf_thres, verbose=False)[0]
+        boxes = []
+        for b in res.boxes:
+            x1, y1, x2, y2 = b.xyxy[0].tolist()
+            boxes.append(((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1, float(b.conf[0])))
+        return boxes
+
+
+# ============================================================ crop (앞단 ②)
+def bbox_crop(img_bgr, cx, cy, bw, bh, margin=CROP_MARGIN):
+    """축정렬 bbox 중심에서 margin 배수 정사각 crop (회전 없음).
+    obb_upright_crop.py 무회전 경로 + _crop_exact 와 동일 규격 → crop_v7 재현.
+    cx,cy,bw,bh: 픽셀 좌표 (YOLO 출력)."""
+    side = int(round(max(bw, bh) * margin))
+    x0 = int(round(cx - side / 2.0))
+    y0 = int(round(cy - side / 2.0))
+    x1, y1 = x0 + side, y0 + side
+    H, W = img_bgr.shape[:2]
+    pad_l, pad_t = max(0, -x0), max(0, -y0)
+    pad_r, pad_b = max(0, x1 - W), max(0, y1 - H)
+    if pad_l or pad_t or pad_r or pad_b:
+        img_bgr = cv2.copyMakeBorder(img_bgr, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_REPLICATE)
+        x0 += pad_l; y0 += pad_t
+    return img_bgr[y0:y0 + side, x0:x0 + side]
+
+
+# ============================================================ 뒷단 파이프라인 (crop 1장 → top-k)
 class PillPipeline:
-    """crop 1장 → top-k item_seq. YOLO 는 이 앞에 crop 공급자로 꽂힘."""
+    """crop 1장 → top-k item_seq. (③④⑤. ScenePipeline 이 내부적으로 이걸 씀)"""
 
     def __init__(self, ckpt, ts_path, encoders, weights_json, db,
                  ocr_gpu=False, ocr_mode='accurate'):
@@ -380,48 +397,64 @@ class PillPipeline:
         self.ocr = OCRReader(use_gpu=ocr_gpu, mode=ocr_mode)
         self.fusion = FusionInferencer(weights_json, db)
         self.db = db
+        self._dm = db['dm_valid'].set_index('item_seq')
+
+    def _name(self, seq):
+        if seq in self._dm.index and 'dl_name' in self._dm.columns:
+            return self._dm.loc[seq]['dl_name']
+        return str(seq)
 
     def run(self, crop_bgr, k=3):
         pc, ps = self.clf.predict(crop_bgr)                 # ③a
-        raw, conf = self.ocr.read(crop_bgr)                 # ③b (raw)
+        raw, conf = self.ocr.read(crop_bgr)                 # ③b
         topk = self.fusion.rank(pc, ps, raw, conf, k=k)     # ④
-        # ⑤ item_seq → 약 이름 매핑(데모 표시용)
-        dm = self.db['dm_valid'].set_index('item_seq')
-        results = []
-        for seq, score in topk:
-            name = dm.loc[seq]['dl_name'] if seq in dm.index and 'dl_name' in dm.columns else str(seq)
-            results.append({'item_seq': seq, 'score': score, 'name': name})
+        results = [{'item_seq': seq, 'score': score, 'name': self._name(seq)}
+                   for seq, score in topk]                  # ⑤
         return {'topk': results, 'ocr_raw': raw, 'ocr_conf': conf,
                 'p_color': pc, 'p_shape': ps}
 
 
-# ============================================================ 사용 예시 (crop 1장 테스트)
-if __name__ == '__main__':
-    import argparse
+# ============================================================ 앞단+뒷단 통합 (원본 씬 → 알약별 top-k)
+class ScenePipeline:
+    """4개 모듈(Detector + Classifier/OCR/Fusion=PillPipeline)을 조립.  ★ 데모 최상위 진입점.
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--ckpt', required=True)
-    ap.add_argument('--ts', required=True)
-    ap.add_argument('--encoders', required=True)
-    ap.add_argument('--weights', required=True)          # 주형 fusion_weights.json
-    ap.add_argument('--drug-master-csv', required=True)
-    ap.add_argument('--crop', required=True)             # 단일 crop png
-    ap.add_argument('--ocr-mode', default='accurate', choices=['accurate', 'fast'])
-    args = ap.parse_args()
+    사용:
+      pipe = ScenePipeline(ckpt=.., ts_path=.., encoders=.., weights_json=.., yolo_pt=.., db=db)
+      results = pipe.run_scene(scene_bgr)      # 알약별 top-k 리스트
+      vis = pipe.visualize(scene_bgr, results) # bbox + top-1 이름 그린 RGB 이미지
+    """
 
-    # DB 1회 로드 (load_drug_master 는 args 객체의 속성을 읽음 → 최소 속성만 채움)
-    class _A:
-        pass
-    a = _A()
-    a.encoders = args.encoders
-    a.drug_master_csv = args.drug_master_csv
-    a.db_user = a.db_pw = a.db_host = a.db_name = None
-    db = load_drug_master(a)
+    def __init__(self, ckpt, ts_path, encoders, weights_json, yolo_pt, db,
+                 ocr_gpu=False, ocr_mode='accurate'):
+        self.detector = Detector(yolo_pt)                          # ①
+        self.backend = PillPipeline(ckpt, ts_path, encoders,       # ③④⑤
+                                    weights_json, db,
+                                    ocr_gpu=ocr_gpu, ocr_mode=ocr_mode)
 
-    pipe = PillPipeline(args.ckpt, args.ts, args.encoders, args.weights, db,
-                        ocr_mode=args.ocr_mode)
-    crop = cv2.imread(args.crop)
-    out = pipe.run(crop, k=3)
-    print("OCR:", out['ocr_raw'], f"(conf={out['ocr_conf']:.3f})")
-    for r in out['topk']:
-        print(f"  {r['item_seq']}  {r['score']:+.3f}  {r['name']}")
+    def run_scene(self, scene_bgr, k=3, det_conf=0.25):
+        """원본 씬 1장 → 검출된 알약마다 top-k. 다중 알약을 순차 집계
+        (알약끼리 독립 → 순차/병렬 결과 동일. 데모 규모엔 순차로 충분)."""
+        boxes = self.detector.detect(scene_bgr, det_conf)          # ①
+        results = []
+        for i, (cx, cy, bw, bh, dconf) in enumerate(boxes):
+            crop = bbox_crop(scene_bgr, cx, cy, bw, bh)
+            out = self.backend.run(crop, k=k)
+            results.append({
+                'pill_idx': i,
+                'bbox': (int(cx - bw / 2), int(cy - bh / 2), int(bw), int(bh)),
+                'det_conf': dconf,
+                'ocr_raw': out['ocr_raw'], 'ocr_conf': out['ocr_conf'],
+                'topk': out['topk'],
+            })
+        return results
+
+    def visualize(self, scene_bgr, results):
+        """bbox + top-1 이름 그린 RGB 이미지 반환 (plt.imshow 로 띄우면 됨)."""
+        vis = cv2.cvtColor(scene_bgr, cv2.COLOR_BGR2RGB)
+        for r in results:
+            x, y, w, h = r['bbox']
+            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 3)
+            top1 = r['topk'][0]['name'] if r['topk'] else '?'
+            cv2.putText(vis, f"#{r['pill_idx']} {top1}", (x, max(y - 8, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        return vis
