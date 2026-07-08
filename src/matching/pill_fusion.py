@@ -346,22 +346,26 @@ def match_fused(query_faces, conf, cand_seqs, pc, ps, cand_info,
     return [seq for sc, tb, seq in scored[:k]]
 
 
-def rank_with_ties(scored, k=3):
-    """(seq,score) 정렬 → 공동순위 top-k. 진짜 동점을 임의정렬로 안 가름."""
-    out, rank, prev, distinct = [], 0, None, 0
-    for idx, (seq, sc) in enumerate(scored):
+def rank_of_gt(ranked, gt):
+    """정답의 공동순위(competition rank) — 노트북 _rank_of_gt 그대로.
+    동점 그룹은 그룹 시작 위치의 rank 로 묶음: [5,5,5,3]에서 gt가 5면 rank=1(공동1위),
+    gt가 3이면 rank=4 (동점 10개 아래 단독이면 rank=11 → top-3 miss).
+    ※ dense-rank(distinct 점수 k개까지 슬롯)와 다름 — 그건 표시용이지 채점용이 아님.
+    """
+    rank, prev, cur = None, None, 0
+    for idx, (seq, sc) in enumerate(ranked):
         if prev is None or sc != prev:
-            distinct += 1
-            if distinct > k:
-                break
-            rank, prev = idx + 1, sc
-        out.append((rank, seq, sc))
-    return out
+            cur = idx + 1          # 새 점수 그룹의 시작 rank
+            prev = sc
+        if seq == gt:
+            return cur
+    return None
 
 
 def in_topk_ties(scored, gt_seq, k=3):
-    """공동순위 채점: 정답이 top-k 공동순위 안에 있으면 True (동점을 운으로 안 가름)."""
-    return any(seq == gt_seq for _, seq, _ in rank_with_ties(scored, k))
+    """공동순위 채점: 정답의 competition rank ≤ k 이면 hit (노트북 채점과 동일)."""
+    pos = rank_of_gt(scored, gt_seq)
+    return pos is not None and pos <= k
 
 
 # ============================================================ 평가
@@ -822,8 +826,9 @@ def run_fit(args, labels, faces, confs, p_by_id, db, params):
     print(f"[fit] (참고) 적합데이터 자체 R@3={res_tr['all']['recall@3']:.4f} — 낙관치, 보고엔 CV 사용")
 
     out = dict(w=[float(v) for v in w_full], feat_names=list(FEAT_NAMES),
-               gate_mode=params['gate_mode'], eps=params['eps'],
-               topk_combo=params['topk_combo'], confusion_groups=list(CONFUSION_GROUPS),
+               gate_mode=params['gate_mode'], gate_params=GATE_DEFAULTS[params['gate_mode']],
+               eps=params['eps'], topk_combo=params['topk_combo'],
+               confusion_groups=list(CONFUSION_GROUPS), sub_cost=0.35,
                fitted_on=args.split, n_fit_queries=nfit,
                cv_recall1=cv_r1, cv_recall3=cv_r3)
     with open(args.weights_out, 'w') as f:
@@ -838,6 +843,13 @@ def run_apply_weights(args, labels, faces, confs, p_by_id, db, params):
     with open(args.weights, 'r') as f:
         wj = json.load(f)
     assert list(wj['feat_names']) == list(FEAT_NAMES), "가중치 JSON 피처 불일치 — 코드 버전 확인"
+    # fit↔apply 상수 skew 가드: WED 혼동쌍·치환비용·gate 임계값이 적합 시점과 같아야 함
+    assert list(wj.get('confusion_groups', CONFUSION_GROUPS)) == list(CONFUSION_GROUPS), \
+        "CONFUSION_GROUPS 가 적합 시점과 다름 — 재적합 필요"
+    assert abs(wj.get('sub_cost', 0.35) - 0.35) < 1e-12, "WED 치환비용이 적합 시점과 다름"
+    if 'gate_params' in wj:
+        assert wj['gate_params'] == GATE_DEFAULTS[wj['gate_mode']], \
+            "gate 파라미터가 적합 시점과 다름 — 재적합 필요"
     params = {**params, 'gate_mode': wj['gate_mode'], 'eps': wj['eps'], 'topk_combo': wj['topk_combo']}
     w = np.array(wj['w'])
     print(f"\n[apply] 새 식 (fitted_on={wj['fitted_on']}, CV R@3={wj.get('cv_recall3', float('nan')):.4f}) "
