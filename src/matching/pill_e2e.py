@@ -319,6 +319,7 @@ class FusionInferencer:
         assert list(wj['feat_names']) == list(FEAT_NAMES), "피처 불일치 — pill_fusion 버전 확인"
         self.w = np.array(wj['w'])
         self.gate_mode = wj['gate_mode']
+        self.gate_params = wj.get('gate_params')   # calibrated 곡선/커스텀 thr — run_apply_weights와 동일 로딩
         self.eps = wj['eps']
         self.topk_combo = wj['topk_combo']
         self.combo_to_items = db['combo_to_items']
@@ -333,7 +334,7 @@ class FusionInferencer:
             return []
         txt = '' if str(ocr_raw_text).strip().upper() in {'', 'NAN', 'NONE'} else str(ocr_raw_text)
         qf = [txt] if txt else []
-        g = gate(ocr_conf, self.gate_mode)
+        g = gate(ocr_conf, self.gate_mode, self.gate_params)
 
         scored = []
         for seq in cand:
