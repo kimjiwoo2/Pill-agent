@@ -33,9 +33,11 @@ def main():
     CC, SC = db['COLOR_CLASSES'], db['SHAPE_CLASSES']
 
     n = c_ok = s_ok = both = 0
+    c_top2 = c_top3 = 0
     miss_crop = miss_gt = 0
-    per_color = defaultdict(lambda: [0, 0])      # gt색: [맞음, 전체]
-    per_shape = defaultdict(lambda: [0, 0])
+    # per-class 집계: true(gt 총) · pred(예측 총) · correct(gt==pred)
+    ct = defaultdict(int); cp = defaultdict(int); cc = defaultdict(int)   # color
+    st = defaultdict(int); sp = defaultdict(int); sc = defaultdict(int)   # shape
     cm_color = defaultdict(int)                   # (gt, pred) 오분류
 
     for r in labels:
@@ -46,31 +48,59 @@ def main():
         if info is None or info['ci'] is None or info['si'] is None:
             miss_gt += 1; continue
         pc, ps = p_by_id[oid]
-        pcol, psh = int(np.argmax(pc)), int(np.argmax(ps))
         gci, gsi = info['ci'], info['si']
+        order = np.argsort(pc)[::-1]              # color 확률 내림차순
+        pcol, psh = int(order[0]), int(np.argmax(ps))
         n += 1
-        cc, ss = (pcol == gci), (psh == gsi)
-        c_ok += cc; s_ok += ss; both += (cc and ss)
-        per_color[CC[gci]][1] += 1; per_color[CC[gci]][0] += cc
-        per_shape[SC[gsi]][1] += 1; per_shape[SC[gsi]][0] += ss
-        if not cc:
-            cm_color[(CC[gci], CC[pcol])] += 1
+        col_ok, sh_ok = (pcol == gci), (psh == gsi)
+        c_ok += col_ok; s_ok += sh_ok; both += (col_ok and sh_ok)
+        c_top2 += (gci in order[:2]); c_top3 += (gci in order[:3])
+        gcn, pcn = CC[gci], CC[pcol]; gsn, psn = SC[gsi], SC[psh]
+        ct[gcn] += 1; cp[pcn] += 1; cc[gcn] += col_ok
+        st[gsn] += 1; sp[psn] += 1; sc[gsn] += sh_ok
+        if not col_ok:
+            cm_color[(gcn, pcn)] += 1
+
+    def prf(true_tot, pred_tot, corr, keys):
+        """per-class precision/recall/f1 + macro·weighted 평균 반환."""
+        rows = []
+        for k in keys:
+            tp = corr[k]; sup = true_tot[k]; pp = pred_tot.get(k, 0)
+            p = tp / pp if pp else 0.0
+            rec = tp / sup if sup else 0.0
+            f1 = 2 * p * rec / (p + rec) if (p + rec) else 0.0
+            rows.append((k, p, rec, f1, sup))
+        N = sum(true_tot.values())
+        cls = [r for r in rows if r[4] > 0]
+        macro = (np.mean([r[1] for r in cls]), np.mean([r[2] for r in cls]), np.mean([r[3] for r in cls]))
+        wf1 = sum(r[3] * r[4] for r in rows) / N if N else 0.0
+        wp = sum(r[1] * r[4] for r in rows) / N if N else 0.0
+        wr = sum(r[2] * r[4] for r in rows) / N if N else 0.0
+        return rows, macro, (wp, wr, wf1)
+
+    def report(title, true_tot, pred_tot, corr):
+        keys = sorted(set(true_tot) | set(pred_tot), key=lambda k: -true_tot.get(k, 0))
+        rows, macro, weigh = prf(true_tot, pred_tot, corr, keys)
+        print(f"\n[{title}]  {'class':<8}{'prec':>7}{'recall':>8}{'f1':>7}{'support':>9}")
+        print("  " + "-" * 46)
+        for k, p, rec, f1, sup in rows:
+            print(f"  {k:<8}{p:>7.3f}{rec:>8.3f}{f1:>7.3f}{sup:>9}")
+        print("  " + "-" * 46)
+        print(f"  {'macro':<8}{macro[0]:>7.3f}{macro[1]:>8.3f}{macro[2]:>7.3f}")
+        print(f"  {'weighted':<8}{weigh[0]:>7.3f}{weigh[1]:>8.3f}{weigh[2]:>7.3f}{sum(true_tot.values()):>9}")
 
     print("\n" + "=" * 56)
-    print(f"[{args.split}] 분류기 head 정확도  (평가 {n} · crop없음 {miss_crop} · GT색형태없음 {miss_gt})")
+    print(f"[{args.split}] 분류기 head 성능  (평가 {n} · crop없음 {miss_crop} · GT색형태없음 {miss_gt})")
     print("-" * 56)
-    print(f"  color accuracy      = {c_ok/max(n,1):.4f}  ({c_ok}/{n})")
-    print(f"  shape accuracy      = {s_ok/max(n,1):.4f}  ({s_ok}/{n})")
-    print(f"  color+shape 동시     = {both/max(n,1):.4f}  ({both}/{n})")
-    print("-" * 56)
-    print("색별 accuracy:")
-    for name, (ok, tot) in sorted(per_color.items(), key=lambda x: -x[1][1]):
-        print(f"  {name:<6} {ok/max(tot,1):.3f}  ({ok}/{tot})")
-    print("모양별 accuracy:")
-    for name, (ok, tot) in sorted(per_shape.items(), key=lambda x: -x[1][1]):
-        print(f"  {name:<6} {ok/max(tot,1):.3f}  ({ok}/{tot})")
-    print("-" * 56)
-    print("주요 색 오분류 (gt→pred, top 8):")
+    print(f"  color  accuracy(top-1) = {c_ok/max(n,1):.4f}  ({c_ok}/{n})")
+    print(f"  color  recall@2 / @3   = {c_top2/max(n,1):.4f} / {c_top3/max(n,1):.4f}")
+    print(f"  shape  accuracy(top-1) = {s_ok/max(n,1):.4f}  ({s_ok}/{n})")
+    print(f"  color+shape 동시        = {both/max(n,1):.4f}  ({both}/{n})")
+
+    report('color', ct, cp, cc)
+    report('shape', st, sp, sc)
+
+    print("\n주요 색 오분류 (gt→pred, top 8):")
     for (g, p), cnt in sorted(cm_color.items(), key=lambda x: -x[1])[:8]:
         print(f"  {g:<6} → {p:<6} {cnt}")
     print("=" * 56)
