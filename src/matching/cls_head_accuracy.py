@@ -31,6 +31,7 @@ def main():
 
     cand_info = db['cand_info']
     CC, SC = db['COLOR_CLASSES'], db['SHAPE_CLASSES']
+    combo = db['combo_to_items']
 
     n = c_ok = s_ok = both = 0
     c_top2 = c_top3 = 0
@@ -39,6 +40,14 @@ def main():
     ct = defaultdict(int); cp = defaultdict(int); cc = defaultdict(int)   # color
     st = defaultdict(int); sp = defaultdict(int); sc = defaultdict(int)   # shape
     cm_color = defaultdict(int)                   # (gt, pred) 오분류
+    # class-head ranking (정답 클래스의 순위 기반)
+    col_rr = shp_rr = col_pgt = shp_pgt = 0.0
+    col_ranksum = shp_ranksum = 0
+    # 약품 레벨 retrieval (색·모양만으로 4,461종 후보 축소·랭킹)
+    cov = {1: 0, 2: 0, 3: 0}                       # coverage@combo-k (정답 약이 후보풀에)
+    dr = {1: 0, 3: 0, 5: 0, 10: 0}                 # drug recall@k (풀 내 정답 랭크)
+    drug_rr = ndcg = 0.0
+    pool_sz = in_pool = 0
 
     for r in labels:
         oid, gt = r['oid'], r['seq']
@@ -60,6 +69,33 @@ def main():
         st[gsn] += 1; sp[psn] += 1; sc[gsn] += sh_ok
         if not col_ok:
             cm_color[(gcn, pcn)] += 1
+
+        # ── class-head ranking (정답 클래스 순위) ──
+        sorder = np.argsort(ps)[::-1]
+        col_rank = int(np.where(order == gci)[0][0]) + 1
+        shp_rank = int(np.where(sorder == gsi)[0][0]) + 1
+        col_rr += 1.0 / col_rank; shp_rr += 1.0 / shp_rank
+        col_ranksum += col_rank; shp_ranksum += shp_rank
+        col_pgt += float(pc[gci]); shp_pgt += float(ps[gsi])
+
+        # ── 약품 레벨 retrieval (색·모양만으로 후보 축소) ──
+        for k in (1, 2, 3):
+            if gt in pf.compress_candidates(pc, ps, combo, CC, SC, topk_combo=k):
+                cov[k] += 1
+        pool = pf.compress_candidates(pc, ps, combo, CC, SC, topk_combo=3)
+        pool_sz += len(pool)
+        if gt in pool:
+            in_pool += 1
+            def _js(s):
+                ii = cand_info[s]
+                pcv = pc[ii['ci']] if ii['ci'] is not None else 0.0
+                psv = ps[ii['si']] if ii['si'] is not None else 0.0
+                return pcv * psv
+            rk = sorted(pool, key=_js, reverse=True).index(gt) + 1
+            drug_rr += 1.0 / rk
+            for k in (1, 3, 5, 10):
+                if rk <= k: dr[k] += 1
+            if rk <= 10: ndcg += 1.0 / np.log2(rk + 1)
 
     def prf(true_tot, pred_tot, corr, keys):
         """per-class precision/recall/f1 + macro·weighted 평균 반환."""
@@ -99,6 +135,23 @@ def main():
 
     report('color', ct, cp, cc)
     report('shape', st, sp, sc)
+
+    nn = max(n, 1)
+    print("\n" + "-" * 56)
+    print("[class-head ranking]  (정답 클래스 순위 기반)")
+    print(f"  color  MRR={col_rr/nn:.4f}  mean-rank={col_ranksum/nn:.3f}  "
+          f"exp_recall(E[P_gt])={col_pgt/nn:.4f}")
+    print(f"  shape  MRR={shp_rr/nn:.4f}  mean-rank={shp_ranksum/nn:.3f}  "
+          f"exp_recall(E[P_gt])={shp_pgt/nn:.4f}")
+
+    print("\n[drug-level retrieval]  색·모양만으로 후보 축소 (4,461종 대상)")
+    print(f"  평균 후보풀 크기        = {pool_sz/nn:.1f} 종")
+    print(f"  coverage@combo 1/2/3   = {cov[1]/nn:.4f} / {cov[2]/nn:.4f} / {cov[3]/nn:.4f}")
+    print(f"  drug recall@1/3/5/10   = {dr[1]/nn:.4f} / {dr[3]/nn:.4f} / {dr[5]/nn:.4f} / {dr[10]/nn:.4f}")
+    print(f"  drug MRR               = {drug_rr/nn:.4f}")
+    print(f"  reach@3 (recall/cov)   = {(dr[3]/nn)/max(cov[3]/nn,1e-9):.4f}")
+    print(f"  NDCG@10                = {ndcg/nn:.4f}")
+    print(f"  후보풀 내 정답 비율      = {in_pool/nn:.4f}  (= coverage@3 상한)")
 
     print("\n주요 색 오분류 (gt→pred, top 8):")
     for (g, p), cnt in sorted(cm_color.items(), key=lambda x: -x[1])[:8]:
