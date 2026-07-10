@@ -34,7 +34,7 @@ def main():
     combo = db['combo_to_items']
 
     n = c_ok = s_ok = both = 0
-    c_top2 = c_top3 = 0
+    c_top2 = c_top3 = s_top2 = s_top3 = 0
     miss_crop = miss_gt = 0
     # per-class 집계: true(gt 총) · pred(예측 총) · correct(gt==pred)
     ct = defaultdict(int); cp = defaultdict(int); cc = defaultdict(int)   # color
@@ -59,11 +59,13 @@ def main():
         pc, ps = p_by_id[oid]
         gci, gsi = info['ci'], info['si']
         order = np.argsort(pc)[::-1]              # color 확률 내림차순
-        pcol, psh = int(order[0]), int(np.argmax(ps))
+        sorder = np.argsort(ps)[::-1]             # shape 확률 내림차순
+        pcol, psh = int(order[0]), int(sorder[0])
         n += 1
         col_ok, sh_ok = (pcol == gci), (psh == gsi)
         c_ok += col_ok; s_ok += sh_ok; both += (col_ok and sh_ok)
         c_top2 += (gci in order[:2]); c_top3 += (gci in order[:3])
+        s_top2 += (gsi in sorder[:2]); s_top3 += (gsi in sorder[:3])
         gcn, pcn = CC[gci], CC[pcol]; gsn, psn = SC[gsi], SC[psh]
         ct[gcn] += 1; cp[pcn] += 1; cc[gcn] += col_ok
         st[gsn] += 1; sp[psn] += 1; sc[gsn] += sh_ok
@@ -71,14 +73,13 @@ def main():
             cm_color[(gcn, pcn)] += 1
 
         # ── class-head ranking (정답 클래스 순위) ──
-        sorder = np.argsort(ps)[::-1]
         col_rank = int(np.where(order == gci)[0][0]) + 1
         shp_rank = int(np.where(sorder == gsi)[0][0]) + 1
         col_rr += 1.0 / col_rank; shp_rr += 1.0 / shp_rank
         col_ranksum += col_rank; shp_ranksum += shp_rank
         col_pgt += float(pc[gci]); shp_pgt += float(ps[gsi])
 
-        # ── 약품 레벨 retrieval (색·모양만으로 후보 축소) ──
+        # ── 약품 레벨 retrieval (색·모양만, pill_fusion 로직 재사용 → 그래프와 동일) ──
         for k in (1, 2, 3):
             if gt in pf.compress_candidates(pc, ps, combo, CC, SC, topk_combo=k):
                 cov[k] += 1
@@ -86,16 +87,18 @@ def main():
         pool_sz += len(pool)
         if gt in pool:
             in_pool += 1
-            def _js(s):
-                ii = cand_info[s]
-                pcv = pc[ii['ci']] if ii['ci'] is not None else 0.0
-                psv = ps[ii['si']] if ii['si'] is not None else 0.0
-                return pcv * psv
-            rk = sorted(pool, key=_js, reverse=True).index(gt) + 1
+        # 각인 없이 색·모양만으로 후보 랭킹 (competition-rank 채점 = 노트북/fusion 동일)
+        scored = pf.match_fused([], 0.0, pool, pc, ps, cand_info,
+                                use_engrave=False, use_gating=False,
+                                dual180=False, cs_gate=False, return_scores=True)
+        for k in (1, 3, 5, 10):
+            if pf.in_topk_ties(scored, gt, k):
+                dr[k] += 1
+        rk = pf.rank_of_gt(scored, gt)
+        if rk is not None:
             drug_rr += 1.0 / rk
-            for k in (1, 3, 5, 10):
-                if rk <= k: dr[k] += 1
-            if rk <= 10: ndcg += 1.0 / np.log2(rk + 1)
+            if rk <= 10:
+                ndcg += 1.0 / np.log2(rk + 1)
 
     def prf(true_tot, pred_tot, corr, keys):
         """per-class precision/recall/f1 + macro·weighted 평균 반환."""
@@ -131,6 +134,7 @@ def main():
     print(f"  color  accuracy(top-1) = {c_ok/max(n,1):.4f}  ({c_ok}/{n})")
     print(f"  color  recall@2 / @3   = {c_top2/max(n,1):.4f} / {c_top3/max(n,1):.4f}")
     print(f"  shape  accuracy(top-1) = {s_ok/max(n,1):.4f}  ({s_ok}/{n})")
+    print(f"  shape  recall@2 / @3   = {s_top2/max(n,1):.4f} / {s_top3/max(n,1):.4f}")
     print(f"  color+shape 동시        = {both/max(n,1):.4f}  ({both}/{n})")
 
     report('color', ct, cp, cc)
@@ -144,7 +148,7 @@ def main():
     print(f"  shape  MRR={shp_rr/nn:.4f}  mean-rank={shp_ranksum/nn:.3f}  "
           f"exp_recall(E[P_gt])={shp_pgt/nn:.4f}")
 
-    print("\n[drug-level retrieval]  색·모양만으로 후보 축소 (4,461종 대상)")
+    print("\n[drug-level retrieval]  색·모양만 (4,461종 대상 · drug recall@3 = 전략비교 그래프의 '색·모양만')")
     print(f"  평균 후보풀 크기        = {pool_sz/nn:.1f} 종")
     print(f"  coverage@combo 1/2/3   = {cov[1]/nn:.4f} / {cov[2]/nn:.4f} / {cov[3]/nn:.4f}")
     print(f"  drug recall@1/3/5/10   = {dr[1]/nn:.4f} / {dr[3]/nn:.4f} / {dr[5]/nn:.4f} / {dr[10]/nn:.4f}")
