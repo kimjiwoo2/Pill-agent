@@ -48,6 +48,9 @@ def main():
     dr = {1: 0, 3: 0, 5: 0, 10: 0}                 # drug recall@k (풀 내 정답 랭크)
     drug_rr = ndcg = 0.0
     pool_sz = in_pool = 0
+    # ★ exp_recall@K: 색·모양 조합을 P(색)×P(모양)로 랭킹 → 정답 조합이 top-K (주 지표)
+    exp = {1: 0, 2: 0, 3: 0}
+    pcov3 = defaultdict(lambda: [0, 0])            # (선택) 색별 coverage@combo3
 
     for r in labels:
         oid, gt = r['oid'], r['seq']
@@ -100,6 +103,17 @@ def main():
             if rk <= 10:
                 ndcg += 1.0 / np.log2(rk + 1)
 
+        # ── exp_recall@K: 색·모양 조합(P_c×P_s) 랭킹에서 정답 조합 top-K ──
+        combos = sorted(((pc[ci] * ps[si], ci, si)
+                         for ci in range(len(pc)) for si in range(len(ps))),
+                        key=lambda x: x[0], reverse=True)
+        gr = next((r for r, (_, ci, si) in enumerate(combos, 1)
+                   if ci == gci and si == gsi), None)
+        for k in (1, 2, 3):
+            if gr is not None and gr <= k:
+                exp[k] += 1
+        pcov3[gcn][1] += 1; pcov3[gcn][0] += int(gt in pool)
+
     def prf(true_tot, pred_tot, corr, keys):
         """per-class precision/recall/f1 + macro·weighted 평균 반환."""
         rows = []
@@ -136,6 +150,9 @@ def main():
     print(f"  shape  accuracy(top-1) = {s_ok/max(n,1):.4f}  ({s_ok}/{n})")
     print(f"  shape  recall@2 / @3   = {s_top2/max(n,1):.4f} / {s_top3/max(n,1):.4f}")
     print(f"  color+shape 동시        = {both/max(n,1):.4f}  ({both}/{n})")
+    print("-" * 56)
+    print(f"  ★ exp_recall@1/2/3     = {exp[1]/max(n,1):.4f} / {exp[2]/max(n,1):.4f} / {exp[3]/max(n,1):.4f}")
+    print(f"     (색·모양 조합 P_c×P_s 랭킹 · 정답 조합 top-K · 주 지표)")
 
     report('color', ct, cp, cc)
     report('shape', st, sp, sc)
@@ -144,9 +161,9 @@ def main():
     print("\n" + "-" * 56)
     print("[class-head ranking]  (정답 클래스 순위 기반)")
     print(f"  color  MRR={col_rr/nn:.4f}  mean-rank={col_ranksum/nn:.3f}  "
-          f"exp_recall(E[P_gt])={col_pgt/nn:.4f}")
+          f"E[P_gt]={col_pgt/nn:.4f}")
     print(f"  shape  MRR={shp_rr/nn:.4f}  mean-rank={shp_ranksum/nn:.3f}  "
-          f"exp_recall(E[P_gt])={shp_pgt/nn:.4f}")
+          f"E[P_gt]={shp_pgt/nn:.4f}")
 
     print("\n[drug-level retrieval]  색·모양만 (4,461종 대상 · drug recall@3 = 전략비교 그래프의 '색·모양만')")
     print(f"  평균 후보풀 크기        = {pool_sz/nn:.1f} 종")
@@ -156,6 +173,10 @@ def main():
     print(f"  reach@3 (recall/cov)   = {(dr[3]/nn)/max(cov[3]/nn,1e-9):.4f}")
     print(f"  NDCG@10                = {ndcg/nn:.4f}")
     print(f"  후보풀 내 정답 비율      = {in_pool/nn:.4f}  (= coverage@3 상한)")
+
+    print("\n[색별 coverage@combo3]  (선택 · fusion 리포트와 동일 지표 — 색별 후보압축 병목)")
+    for name, (ok, tot) in sorted(pcov3.items(), key=lambda x: -x[1][1]):
+        print(f"  {name:<6} {ok/max(tot,1):.3f}  ({ok}/{tot})")
 
     print("\n주요 색 오분류 (gt→pred, top 8):")
     for (g, p), cnt in sorted(cm_color.items(), key=lambda x: -x[1])[:8]:
