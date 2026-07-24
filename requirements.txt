@@ -1,0 +1,23 @@
+# PILLAR 의존성 (Colab 기본 외에도 재현을 위해 직접 의존성 명시)
+# 버전은 실제 사용 버전으로 필요 시 고정.
+
+# --- Detection (YOLO) ---
+ultralytics>=8.3
+opencv-python-headless
+matplotlib
+
+# --- Fusion (분류기 추론·랭킹·DB) ---
+torch
+torchvision
+Pillow
+scikit-learn
+scipy
+sqlalchemy
+pymysql
+
+# --- 공통 ---
+numpy
+pandas
+
+# ※ classification·ocr·rag·demo 담당 의존성(paddleocr, gradio, openai, rapidfuzz 등)은
+#   통합 시 추가.

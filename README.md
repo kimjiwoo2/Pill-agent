@@ -107,3 +107,34 @@ AI Hub 라벨 JSON을 파싱하여 MySQL DB에 적재했다.
 | 3 | 속성 분류기 EfficientNet-B3 2-head | 노트북 완료, 학습 실행 대기 |
 | 4 | EasyOCR 프로토타입 | 미완료 |
 | 5 | 속성 분류기 + OCR 앙상블 | 미완료 |
+
+---
+
+## 실행 방법 (Detection & Fusion)
+
+> 데이터·가중치·시크릿은 git에 없으며 드라이브에 보관한다. 접근은 담당자에게 요청.
+
+### 설치
+```bash
+pip install -r requirements.txt
+```
+
+### YOLO 검출 학습 — `src/detection/yolo_detect_train.py`
+1-class 축정렬 bbox YOLOv11n 학습 (OBB 미사용).
+```bash
+python src/detection/yolo_detect_train.py --mode all \
+  --data-root <데이터 루트> --name yolo11n_detect_v1
+```
+- 필요 자산: manifest(`manifest_clean_20k_33340.csv`), 학습 이미지(`images_train.zip` / `images_val.zip`)
+
+### Fusion 평가 — `src/matching/pill_fusion.py`
+색·모양 분류기 + 각인(OCR) 융합으로 후보 약품 top-k 랭킹.
+```bash
+python src/matching/pill_fusion.py --split test \
+  --drug-master-csv drug_master.csv --encoders label_encoders_20k_11cls.pkl \
+  --ckpt best_20k_v3_5_nosampler_ep16_v3.pth --ts temperature_...pkl \
+  --labels-csv final_test_manifest.csv --crops test_filtered.zip \
+  --ocr-csv ocr_result_final_v1_test.csv --weights fw_final.json
+```
+- 필요 자산(드라이브 `fusion_test/`): 분류기 ckpt·TS·인코더, `fw_final.json`, `drug_master.csv`, crop·OCR CSV
+- DB 직접 조회 시 환경변수: `PILLIOT_DB_HOST`, `PILLIOT_DB_USER`, `PILLIOT_PW` (`--drug-master-csv` 사용 시 불필요)
