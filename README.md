@@ -119,18 +119,18 @@ AI Hub 라벨 JSON을 파싱하여 MySQL DB에 적재했다.
 pip install -r requirements.txt
 ```
 
-### YOLO 검출 학습 — `src/detection/yolo_detect_train.py`
+### YOLO 검출 학습 — `final/detection/yolo_detect_train.py`
 1-class 축정렬 bbox YOLOv11n 학습 (OBB 미사용).
 ```bash
-python src/detection/yolo_detect_train.py --mode all \
+python final/detection/yolo_detect_train.py --mode all \
   --data-root <데이터 루트> --name yolo11n_detect_v1
 ```
 - 필요 자산: manifest(`manifest_clean_20k_33340.csv`), 학습 이미지(`images_train.zip` / `images_val.zip`)
 
-### Fusion 평가 — `src/matching/pill_fusion.py`
+### Fusion 평가 — `final/matching/pill_fusion.py`
 색·모양 분류기 + 각인(OCR) 융합으로 후보 약품 top-k 랭킹.
 ```bash
-python src/matching/pill_fusion.py --split test \
+python final/matching/pill_fusion.py --split test \
   --drug-master-csv drug_master.csv --encoders label_encoders_20k_11cls.pkl \
   --ckpt best_20k_v3_5_nosampler_ep16_v3.pth --ts temperature_...pkl \
   --labels-csv final_test_manifest.csv --crops test_filtered.zip \
