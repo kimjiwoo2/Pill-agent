@@ -528,9 +528,9 @@ def parse_args():
     p.add_argument('--crops', required=True)
     p.add_argument('--ocr-csv', required=True)
     # DB (csv 없을 때)
-    p.add_argument('--db-host', default='103.218.161.72')
-    p.add_argument('--db-name', default='pilliot_db')
-    p.add_argument('--db-user', default='zuhyeong_admin')
+    p.add_argument('--db-host', default=os.environ.get('PILLIOT_DB_HOST', ''))
+    p.add_argument('--db-name', default=os.environ.get('PILLIOT_DB_NAME', 'pilliot_db'))
+    p.add_argument('--db-user', default=os.environ.get('PILLIOT_DB_USER', ''))
     p.add_argument('--db-pw', default=os.environ.get('PILLIOT_PW', ''))
     # fusion 파라미터
     p.add_argument('--topk-combo', type=int, default=3)
