@@ -1,4 +1,4 @@
-# pill OBB 학습용 격리 환경 패키지
+# YOLO 검출 학습용 격리 환경 패키지
 # 설치: pip install -r requirements.txt  (venv 활성화 상태에서)
 # 주의: torch 기본 PyPI 휠은 CUDA 런타임을 내장하므로 대개 그대로 GPU 인식됨.
 #       머신 CUDA와 안 맞으면 아래처럼 특정 빌드 지정:
