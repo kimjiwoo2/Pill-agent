@@ -34,4 +34,4 @@ PY
 
 echo
 echo "완료. 매번 이걸로 활성화:  source $ENV_DIR/bin/activate"
-echo "이후 실행 예:  python $HERE/obb_rotation_train.py --mode verify --data-root /data/pill_obb"
+echo "이후 실행 예:  python $HERE/yolo_detect_train.py --mode all --data-root /data/pill"
