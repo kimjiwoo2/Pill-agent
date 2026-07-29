@@ -15,8 +15,8 @@ pill_e2e.py — PILLiOT end-to-end 모듈 (앞단 YOLO + 뒷단 분류/OCR/fusio
     → ⑤  top-k item_seq
 
 의존:
-  - 주형 pill_fusion.py import (fusion 로직 단일 소스)
-  - 윤수 final_v1 OCR 전처리를 OCRReader 에 이식 (val 재현 경로)
+  - pill_fusion.py import (fusion 로직 단일 소스)
+  - OCR final_v1 전처리를 OCRReader 에 이식 (val 재현 경로)
   - YOLO 추론은 ultralytics (앞단, 별도 학습된 best.pt)
 """
 import json
@@ -31,7 +31,7 @@ from PIL import Image
 from torchvision import models, transforms
 import torchvision.transforms.functional as TF
 
-# ── 주형 pill_fusion.py 에서 재사용 (로직 단일 소스) ──
+# ── pill_fusion.py 에서 재사용 (로직 단일 소스) ──
 from pill_fusion import (
     compress_candidates,
     cand_features,
@@ -113,7 +113,7 @@ class Classifier:
 # ============================================================ ③b OCR (단건, raw 반환)
 class OCRReader:
     """crop 1장(BGR) → (raw_text, conf).  ★ 정규화 안 함 — fusion 내부에서 1회.
-    윤수 final_v1 전처리 이식: load_and_prepare → 12각도 confidence 탐색 → _extract.
+    OCR final_v1 전처리 이식: load_and_prepare → 12각도 confidence 탐색 → _extract.
 
     mode: 'accurate'(12각도, val 재현, 느림) | 'fast'(단일 predict, 데모 속도용)
     """

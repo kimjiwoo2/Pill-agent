@@ -44,7 +44,7 @@ import numpy as np
 import pandas as pd
 
 
-# ============================================================ 각인 정규화 · CER (윤수 이식)
+# ============================================================ 각인 정규화 · CER (OCR 파트에서 이식)
 IGNORE_IMPRINT_TOKENS = {'', 'NAN', 'NONE', 'NULL', '마크', '분할선', '없음', '무', '-', '십자'}
 _RE_STRIP_TOKENS = re.compile(r'\s+|분할선|마크|\|')
 _RE_ALLOWED = re.compile(r'[^0-9A-Z가-힣+\-/]')
