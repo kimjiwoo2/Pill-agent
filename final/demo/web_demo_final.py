@@ -1,0 +1,1518 @@
+# -*- coding: utf-8 -*-
+"""PILLAR 웹 데모 — 알약 사진 → 식별 → 개인화 복약지도서 (Colab + Gradio)
+
+
+
+
+
+- 런타임: **T4 GPU** (메뉴: 런타임 > 런타임 유형 변경)
+- **[준비 파트]** 발표 전 1회 (설치+로드 5~10분) / **[데모 파트]** 발표장에서 셀 I만
+- 필요 Colab Secrets (왼쪽 🔑): `UPSTAGE_API_KEY`, `DB_HOST`, `DB_USER`, `DB_PASSWORD` (+ 노트북 접근 허용 토글)
+- 필요 Drive 자산: `내 드라이브/Pillot/fusion_test/` (모델/설정 파일 + `demo_images/`)
+
+파이프라인: 사진 → YOLO 검출 → 분류기+OCR+fusion top-3 → 사용자 선택+개인정보 → DUR 조회 → **어댑터(활성화·개인화 매칭)** → Solar 본문(3~7절) + Python 안전절(1·2·8·면책) → 복약지도서
+
+## [준비 파트] — 발표 전 1회만. 데모 중엔 실행하지 않음.
+"""
+
+# [셀 A] 설치 (단일 셀) — 전체 의존성 + OCR GPU/CPU 선택. 실행 후 반드시 런타임 재시작 → 셀 B부터.
+USE_GPU_OCR = False   # CPU OCR(안정·torch와 무충돌). GPU로 속도 올리려면 True(단, CUDA 충돌 위험).
+
+import subprocess
+def sh(cmd):
+    print("$", cmd)
+    subprocess.run(cmd, shell=True, check=False)
+
+# 공통 패키지. ⚠️ numpy는 다운그레이드하지 않는다 — Colab 2026 기본 numpy 2.x이고 pandas/torch가
+# 전부 numpy 2로 빌드돼 있어, numpy<2로 내리면 'numpy.dtype size changed(96 vs 88)' ABI 충돌이 난다.
+# paddle 3.1은 numpy 2를 지원한다.
+sh('pip -q install "paddleocr>=3.0.0,<3.8" pymysql sqlalchemy ultralytics openai "gradio>=4.44,<6"')
+
+if USE_GPU_OCR:
+    # GPU paddle이 nvidia-nccl을 자기 버전으로 덮어써 Colab torch import를 깨는 함정 → nccl 복구.
+    sh('pip -q install paddlepaddle-gpu==3.1.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/')
+    #  ↑ 설치 실패 시 Colab CUDA에 맞춰 cu126 → cu123/cu121 로 (확인: !nvcc --version)
+    sh('pip -q install -U nvidia-nccl-cu12')   # torch의 ncclCommShrink 심볼 복구 (충돌 해결의 핵심)
+else:
+    sh('pip -q install paddlepaddle==3.1.0')   # CPU 빌드 (torch와 충돌 없음)
+
+sh('pip -q install "numpy>=2.0,<3"')           # paddle 등이 numpy를 끌어내렸으면 2.x로 복원(ABI 정합 핵심)
+sh('apt-get -qq -y install fonts-nanum')       # 검출 시각화 한글 라벨용
+print("\n설치 완료 (OCR GPU =", USE_GPU_OCR, ") — [런타임 > 세션 다시 시작] 후 [셀 B]부터 실행하세요.")
+
+# [셀 B] Drive mount + 레포 경로 + 모듈 경로
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os, sys
+REPO_ROOT = os.getenv('PILLAR_REPO_ROOT', '/content/Pillar')
+assert os.path.exists(REPO_ROOT), (
+    f"repo path not found: {REPO_ROOT}. Clone the repo first or set PILLAR_REPO_ROOT."
+)
+for _p in [f'{REPO_ROOT}/final/matching', f'{REPO_ROOT}/final/llm']:
+    if _p not in sys.path:
+        sys.path.append(_p)
+print("repo OK:", os.popen(f'cd {REPO_ROOT} && git log --oneline -1').read().strip())
+
+# [셀 C] 시크릿 → 환경변수 (⚠️ LLM 모듈 import 전에 반드시 — build_llm_payload가 import 시점에 DB env를 읽음)
+from google.colab import userdata
+import os
+
+def _secret(name, default=None, required=True):
+    try:
+        v = userdata.get(name)
+    except Exception:
+        v = None
+    v = os.getenv(name) or v or default
+    if required:
+        assert v, f"Colab Secrets에 '{name}' 없음/미허용 — 왼쪽 🔑에서 등록하고 '노트북 접근' 토글을 켜세요"
+    return v
+
+os.environ['UPSTAGE_API_KEY'] = _secret('UPSTAGE_API_KEY')
+os.environ['DB_USER']     = _secret('DB_USER')
+os.environ['DB_PASSWORD'] = _secret('DB_PASSWORD')
+os.environ['DB_HOST'] = _secret('DB_HOST')
+os.environ['DB_PORT'] = _secret('DB_PORT', default='3306', required=False)
+os.environ['DB_NAME'] = _secret('DB_NAME', default='pilliot_db', required=False)
+print("secrets OK (값은 출력하지 않음)")
+
+# [셀 D] CONFIG — 자산 경로 검증 + EXIF-안전 이미지 로더
+import os, glob
+import numpy as np
+import cv2
+from PIL import Image, ImageOps
+
+FT = os.getenv('PILLIOT_FUSION_TEST_DIR', '/content/drive/MyDrive/Pillot/fusion_test')
+
+# OCR 정확도-속도 4단계 (원 코드 변경 없음 — OCRReader의 angle_step 파라미터 활용)
+#   fast     : 1방향 (가장 빠름, 회전 각인에 약함)
+#   balanced : 4방향 (90° 간격) — 가장 가볍게 회전 대응
+#   medium   : 8방향 (45° 간격) — balanced의 2배·accurate의 2/3  ← 기본값(속도·정확도 절충)
+#   accurate : 12방향 (30° 간격) — val 재현 조건 (가장 느림·정밀)
+OCR_LEVEL = 'medium'
+_OCR_CFG = {'fast': ('fast', 360), 'balanced': ('accurate', 90),
+            'medium': ('accurate', 45), 'accurate': ('accurate', 30)}
+OCR_MODE, OCR_ANGLE = _OCR_CFG[OCR_LEVEL]
+print(f"OCR_LEVEL={OCR_LEVEL} → {len(range(0, 360, OCR_ANGLE))}방향(step {OCR_ANGLE}°)" if OCR_MODE!='fast' else "OCR_LEVEL=fast → 1방향")
+
+CFG = dict(
+    ckpt     = f'{FT}/best_20k_v3_5_nosampler_ep16_v3.pth',
+    ts       = f'{FT}/temperature_20k_v3_5_nosampler_ep16_v3.pkl',
+    encoders = f'{FT}/label_encoders_20k_11cls.pkl',
+    weights  = f'{REPO_ROOT}/final/matching/fw_final.json',
+    yolo_pt  = f'{FT}/best.pt',
+    drug_csv = f'{FT}/drug_master.csv',
+)
+DEMO_DIR = f'{FT}/demo_images'
+
+_missing = {k: v for k, v in CFG.items() if not os.path.exists(v)}
+assert not _missing, f"자산 누락: {_missing}"
+
+ALLOWED_EXT = {'.jpg', '.jpeg', '.png'}
+MAX_MB = 25
+
+# 확장자 대소문자 무관 수집 (.JPG/.PNG 누락 방지 — 리눅스 FS는 대소문자 구분)
+demo_scenes = sorted(p for p in glob.glob(f'{DEMO_DIR}/*')
+                     if os.path.splitext(p)[1].lower() in ALLOWED_EXT)
+print(f"자산 6개 OK | 데모 이미지 {len(demo_scenes)}장:", [os.path.basename(p) for p in demo_scenes])
+assert demo_scenes, f"데모 이미지 없음: {DEMO_DIR}"
+
+def load_scene_bgr(path):
+    # EXIF 회전 보정(폰 사진 필수) 후 BGR 반환. 업로드 파일은 임시경로로만 쓰고 저장하지 않는다.
+    ext = os.path.splitext(str(path))[1].lower()
+    if ext not in ALLOWED_EXT:
+        raise ValueError(f"지원하지 않는 형식입니다: {ext} (jpg/png만 가능)")
+    if os.path.getsize(path) > MAX_MB * 1024 * 1024:
+        raise ValueError(f"파일이 너무 큽니다 (최대 {MAX_MB}MB)")
+    img = Image.open(path)
+    img = ImageOps.exif_transpose(img).convert('RGB')
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+print("CONFIG OK")
+
+# [셀 E] CV 파이프라인 조립 (YOLO+분류기+OCR+fusion) — 전역 1회 로드, 이후 재사용
+from pill_e2e import ScenePipeline
+from pill_fusion import load_drug_master
+
+class _Args:
+    pass
+
+_a = _Args()
+_a.encoders = CFG['encoders']
+_a.drug_master_csv = CFG['drug_csv']   # CSV 사용 → CV 경로는 DB 불필요
+db = load_drug_master(_a)
+_has_name = 'dl_name' in db['dm_valid'].columns
+print(f"drug_master {len(db['dm_valid'])}종 | 표시명(dl_name): {'있음' if _has_name else '없음 → item_seq로 표시'}")
+
+# 디바이스 진단: YOLO/분류기는 torch(GPU 자동), OCR은 설치된 paddle 빌드에 따라 결정
+import torch as _torch
+_torch_gpu = _torch.cuda.is_available()
+try:
+    import paddle as _paddle
+    _paddle_gpu = _paddle.device.is_compiled_with_cuda()
+except Exception:
+    _paddle_gpu = False
+if not _torch_gpu:
+    print("⚠️ GPU 런타임이 아닙니다 — [런타임 > 런타임 유형 변경 > T4 GPU] 후 A부터 다시 실행하세요 (지금은 전부 CPU라 매우 느림).")
+
+pipe = ScenePipeline(
+    ckpt=CFG['ckpt'], ts_path=CFG['ts'], encoders=CFG['encoders'],
+    weights_json=CFG['weights'], yolo_pt=CFG['yolo_pt'], db=db,
+    ocr_gpu=_paddle_gpu,      # 셀 A USE_GPU_OCR=True로 GPU paddle 설치했으면 자동 True → OCR GPU
+    ocr_mode=OCR_MODE,
+)
+pipe.backend.ocr.angle_step = OCR_ANGLE   # balanced=90°(4각도) / accurate=30°(12각도)
+print(f"CV 준비 완료 | YOLO·분류기 GPU={_torch_gpu} · OCR GPU={_paddle_gpu} "
+      f"(OCR {OCR_LEVEL}: mode={OCR_MODE}, angle={OCR_ANGLE})")
+if _torch_gpu and not _paddle_gpu:
+    print("  ↳ OCR이 CPU라 느리면: 셀 A의 USE_GPU_OCR=True로 재설치 → 런타임 재시작 → B부터")
+
+# [셀 F] LLM 리포트 스택 — 빌더 2개 + 지도서 생성기 + DB 연결 (셀 C 이후에 실행)
+import importlib.util, functools
+
+import build_llm_payload as blp                                            # (1) DUR facts
+from build_llm_delivery_payload import build_delivery_item, make_engine    # (2) 축약+허가 결합
+
+# (4) 지도서 생성기: repo → Drive 순 폴백
+_REPORT_PATHS = [
+    f'{REPO_ROOT}/final/llm/generate_personalized_single_drug_report.py',
+    f'{FT}/generate_personalized_single_drug_report.py',
+]
+_rp = next((p for p in _REPORT_PATHS if os.path.exists(p)), None)
+assert _rp, f"지도서 생성기 파일 없음 — 확인 경로: {_REPORT_PATHS}"
+_spec = importlib.util.spec_from_file_location('report_mod', _rp)
+report_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(report_mod)
+print("report 모듈 로드:", _rp)
+
+# 검증 확정본 프롬프트로 명시 고정 (repo 파일과 동일해도 데모 불변성 보장)
+FIXED_BODY_SYSTEM_PROMPT = '''
+당신은 한국 의약품 복약지도서의 **대상 약품 1품목 본문(3~7절)**만 작성하는 보조 시스템입니다.
+
+독자는 어르신과 보호자입니다. 어려운 의학용어 대신 쉬운 우리말을 쓰고, 짧고 분명한 존댓말 능동문으로 안내하듯 씁니다. 겁을 주는 표현 대신 차분한 안내형 문장을 씁니다.
+
+# 입력 계약 (반드시 준수)
+당신이 받는 입력 JSON에는 **정확히 다음 3개 최상위 키만** 존재하며, 그 외의 키는 존재하지 않습니다.
+- target_drug: { item_seq, item_name(약 이름), company_name(제조사), product_form(제형), ingredient_names[](성분 이름) }
+- target_drug_specific_warnings: { direct_warnings[]{ type, content, remark, age_standard, pregnancy_grade, maximum_quantity(최대용량), maximum_duration(최대투여기간), applicability }, dose_references[]{ ingredient(성분), maximum_quantity, content, applicability }, split_cautions[]{ type, content, remark } }
+- target_permission_information: { source_status, permission_text{ efficacy(효능효과), dosage(용법용량), precautions(사용상의 주의사항), storage_method(보관방법), valid_term(사용기한), pack_unit(포장단위) }, product_information{ item_name, company_name, etc_otc_code, ... } }
+
+위 3개 키에 실제로 담긴 값만 근거로 삼습니다.
+
+# 절대 규칙 — 위반 금지
+1. **다른 약과의 병용·상호작용, 효능군 중복, 보유약, 사용자 개인 맞춤 주의(나이·임신·기저질환 등 메타데이터)는 입력에 아예 없습니다.** 따라서 이를 참조·언급·추론·예고·판단·반복하지 않습니다. "함께 먹는 약", "다른 약과 함께", "복용 중인 약", "환자분의 상태에 따라" 같은 표현이나 병용을 다루는 절·문장을 절대 만들지 않습니다. 그 내용은 프로그램(Python)이 별도 절로 결정론적으로 작성하므로 당신이 손대면 안 됩니다. 이 분리가 시스템의 핵심 안전장치입니다.
+   - 단, target_drug_specific_warnings에 들어 있는 이 약 자체의 DUR 주의(최대 용량·최대 투여기간·연령 기준·임부 등급 등)는 "이 약 고유의 주의"이므로 6절에 씁니다. 이는 "다른 약과의 병용"이 아닙니다. type이 DOSE_CAUTION 등 내부코드여도 이 약 자체의 주의로 다룹니다.
+2. 당신은 **정확히 3·4·5·6·7절만** 생성합니다. 1절·2절·8절·면책 문구는 만들지 않습니다(프로그램이 붙입니다).
+3. 입력 JSON에 없는 의학지식·판단·부작용 나열·신체기관별 이상반응 목록·용량조절·증량/감량·복용중단·대체약·검사·진단·작용기전·질병설명·적응증 해설을 추가하지 않습니다(환각 금지). 효능을 풀어 쓸 때도 원문에 없는 질병 설명·증상 부연을 덧붙이지 않습니다. 없는 내용을 지어내지 않습니다. 특히 6절에서 입력 필드에 없는 일반적·상투적 주의(예: "정해진 용량을 지켜 복용하는 것이 중요합니다")를 별도 항목으로 채워 넣거나, remark 같은 짧은 문구를 원문에 없는 인과·의학적 단정(예: "이보다 많이 복용하면 간이 손상될 수 있습니다")으로 확대·부연하지 않습니다.
+4. target_drug의 제형과 다른 제형의 효능·용법은 쓰지 않습니다.
+
+# 출력 절 구조 — 머리말을 아래 문구·번호 그대로 마크다운 h2로 씁니다
+## 3. 의약품 기본정보
+## 4. 효능·효과
+## 5. 복용방법
+## 6. DUR 및 주요 주의사항
+## 7. 보관방법
+번호·제목을 바꾸거나 "3)", "제3절" 등으로 변형하지 않습니다. 위 5개 머리말 외 다른 머리말을 만들지 않습니다.
+
+# 절 ↔ 근거 필드 매핑 — 이 배치를 강제
+- ## 3. 의약품 기본정보 ← target_drug(item_name, company_name, product_form, ingredient_names) + product_information. etc_otc_code가 ETC이면 "전문의약품", OTC이면 "일반의약품"으로 한국어화하여 서술합니다.
+- ## 4. 효능·효과 ← permission_text.efficacy. 원문 내용만 쉬운 말로 핵심 1~3문장 요약.
+- ## 5. 복용방법 ← permission_text.dosage + target_drug_specific_warnings.split_cautions(제형 취급·분할 관련 주의). 허가된 핵심 용법과 제형 관련 복용 주의만 씁니다.
+- ## 6. DUR 및 주요 주의사항 ← target_drug_specific_warnings.direct_warnings + dose_references + permission_text.precautions. **최대 5개 항목.** maximum_duration(최대 투여기간)·maximum_quantity(최대 용량)이 있으면 일반 허가 주의사항보다 **우선하여 포함**합니다. DOSE_CAUTION 같은 내부코드는 단독 출력하지 말고 일반인이 이해할 한국어 제목으로 바꿉니다. 이상반응/신체기관별 부작용 전체 목록은 나열하지 않습니다. 각 항목은 그 근거가 된 입력 필드(content·remark·maximum_quantity 등)에 실제로 담긴 내용만으로 작성하고, 개수를 채우려고 근거 없는 항목을 추가하지 않습니다.
+- ## 7. 보관방법 ← permission_text.storage_method, valid_term(사용기한), pack_unit(포장단위). 있는 것만 씁니다.
+
+# 내부코드 → 한국어 변환 예시
+- DOSE_CAUTION → 용량 주의
+- MAX_DURATION / maximum_duration → 최대 투여기간
+- MAX_QUANTITY / maximum_quantity → 최대 용량(1일 최대 용량)
+- AGE_STANDARD / age_standard → 연령 기준 주의
+- PREGNANCY_GRADE / pregnancy_grade → 임부 사용 주의
+- SPLIT_CAUTION → 분할·취급 주의
+표에 없는 내부코드가 나오면 뜻이 통하는 자연스러운 한국어 제목으로 바꿔 씁니다.
+
+# 빈 필드 처리
+어떤 절의 근거 필드가 null·빈 문자열·빈 리스트이거나 존재하지 않으면 내용을 지어내지 않습니다. 해당 절 전체 근거가 비어 있으면 그 절 본문을 "해당 정보가 제공되지 않았습니다. 처방한 의사나 약사에게 확인하세요."로 짧게 처리합니다. 일부 필드만 비어 있으면 있는 필드만으로 서술합니다. source_status가 AVAILABLE(또는 '허가')이 아니면 permission_text 기반 절(4·5·6·7절)의 확인되지 않은 내용을 채우지 말고 위와 같이 짧게 처리합니다.
+
+**빈 필드 처리와 분량 규칙이 충돌할 때:** 근거 필드가 대부분 비어 있어 아래 700자 하한을 채울 수 없으면, **분량 하한보다 빈 필드 처리와 환각 금지 규칙이 우선합니다.** 근거 없는 내용을 지어내 분량을 채우지 말고, 있는 근거만으로 짧게 쓰고 나머지는 "해당 정보가 제공되지 않았습니다. 처방한 의사나 약사에게 확인하세요."로 처리하여 700자에 못 미쳐도 그대로 둡니다. 700~1,000자 하한은 근거가 충분한 경우에만 적용됩니다.
+
+# 형식·분량·어조
+- 표(마크다운/HTML)를 절대 쓰지 않습니다. 자연스러운 한국어 문장이나 짧은 항목 나열로 서술합니다.
+- 근거가 충분하면 전체 본문(머리말 포함)은 공백 포함 700~1,000자로 작성합니다. 분량을 맞추려고 입력에 없는 내용을 지어내지 않으며, 근거가 부족하면 위 '빈 필드 처리'를 따릅니다.
+- 어려운 용어는 괄호로 쉬운 말을 병기합니다. 예: 정제(알약 형태), 경구(입으로 복용).
+- 같은 주의사항이나 내용을 여러 절에서 반복하지 않습니다.
+
+# 예시 (few-shot)
+입력:
+{
+  "target_drug": {
+    "item_seq": "200812345",
+    "item_name": "가나정 500밀리그램",
+    "company_name": "가나제약",
+    "product_form": "정제",
+    "ingredient_names": ["아세트아미노펜"]
+  },
+  "target_drug_specific_warnings": {
+    "direct_warnings": [
+      { "type": "DOSE_CAUTION", "content": "1일 4000밀리그램을 초과하여 복용하지 않는다.", "remark": null, "age_standard": null, "pregnancy_grade": null, "maximum_quantity": "4000mg/일", "maximum_duration": null, "applicability": "성인" },
+      { "type": "MAX_DURATION", "content": "별다른 지시가 없으면 10일을 넘겨 복용하지 않는다.", "remark": null, "age_standard": null, "pregnancy_grade": null, "maximum_quantity": null, "maximum_duration": "10일", "applicability": "성인" }
+    ],
+    "dose_references": [
+      { "ingredient": "아세트아미노펜", "maximum_quantity": "4000mg/일", "content": "성인 1일 최대 용량", "applicability": "성인" }
+    ],
+    "split_cautions": [
+      { "type": "SPLIT_CAUTION", "content": "쪼개거나 씹지 말고 물과 함께 삼킨다.", "remark": null }
+    ]
+  },
+  "target_permission_information": {
+    "source_status": "허가",
+    "permission_text": {
+      "efficacy": "감기로 인한 발열 및 통증, 두통, 근육통, 신경통, 생리통, 관절통의 완화.",
+      "dosage": "성인 1회 1~2정, 1일 3~4회 필요시 복용한다. 복용 간격은 4시간 이상으로 하고, 1일 6정을 초과하지 않는다.",
+      "precautions": "이 약에 과민증이 있는 환자는 복용하지 않는다. 음주 시 복용을 피한다. 공복 시 복용하면 위장 장애가 나타날 수 있으므로 식후 복용을 권장한다.",
+      "storage_method": "실온에서 습기와 빛을 피해 보관한다. 어린이의 손이 닿지 않는 곳에 보관한다.",
+      "valid_term": "제조일로부터 36개월",
+      "pack_unit": "100정/병"
+    },
+    "product_information": {
+      "item_name": "가나정 500밀리그램",
+      "company_name": "가나제약",
+      "etc_otc_code": "OTC"
+    }
+  }
+}
+
+출력:
+## 3. 의약품 기본정보
+이 약은 가나제약에서 만든 '가나정 500밀리그램'입니다. 처방전 없이 약국에서 살 수 있는 일반의약품이며, 제형은 정제(알약 형태)입니다. 주성분은 아세트아미노펜이고, 한 정에 500밀리그램이 들어 있습니다.
+
+## 4. 효능·효과
+감기로 인한 발열과 통증, 두통, 근육통, 신경통, 생리통, 관절통을 완화하는 데 사용하는 약입니다.
+
+## 5. 복용방법
+성인은 1회에 1~2정을 하루 3~4회, 필요할 때 복용합니다. 복용 간격은 4시간 이상 두는 것이 좋고, 하루에 6정을 넘기지 않도록 합니다. 알약은 쪼개거나 씹지 말고, 충분한 물과 함께 그대로 삼켜 드세요.
+
+## 6. DUR 및 주요 주의사항
+- 최대 용량: 성인은 하루 4,000밀리그램(4그램)을 넘지 않게 복용하세요. 이 성분(아세트아미노펜)의 성인 1일 최대 용량도 4,000밀리그램입니다.
+- 최대 투여기간: 별다른 지시가 없으면 10일을 넘겨 복용하지 마세요.
+- 과민증 주의: 이 약에 과민 반응(알레르기)이 있었던 분은 복용하지 마세요.
+- 음주 주의: 술을 마셨을 때는 이 약의 복용을 피하세요.
+- 공복 주의: 공복에 복용하면 속이 불편할 수 있으니 되도록 식사한 뒤에 드세요.
+
+## 7. 보관방법
+실온에서 습기와 직사광선을 피해 보관하세요. 사용기한은 제조일로부터 36개월이며, 포장 단위는 100정들이 병입니다. 어린이의 손이 닿지 않는 곳에 보관하세요.
+'''.strip()
+report_mod.BODY_SYSTEM_PROMPT = FIXED_BODY_SYSTEM_PROMPT
+print(f"BODY_SYSTEM_PROMPT 고정: {len(FIXED_BODY_SYSTEM_PROMPT)}자")
+
+# Solar 클라이언트 타임아웃 60s (재시도 루프가 데모를 오래 잡지 않게)
+from openai import OpenAI as _OpenAI
+report_mod.OpenAI = functools.partial(_OpenAI, timeout=60.0)
+
+# DUR 조회용 DB 연결 + ping
+from sqlalchemy import text as _sqltext
+engine = make_engine()
+with engine.connect() as _c:
+    _c.execute(_sqltext('SELECT 1'))
+print("DB 연결 OK")
+
+# ── 약품 표시명 맵: drug_master.csv엔 이름 컬럼이 없어 item_seq가 그대로 노출되던 문제 해결 ──
+import pandas as _pd
+_cols = _pd.read_sql('SELECT * FROM drug_master LIMIT 1', engine).columns.tolist()
+_name_col = next((c for c in ['dl_name', 'item_name', 'drug_name', '품목명'] if c in _cols), None)
+NAME_MAP = {}
+if _name_col:
+    _nm = _pd.read_sql(f'SELECT item_seq, `{_name_col}` AS nm FROM drug_master', engine)
+    NAME_MAP = {str(r.item_seq): str(r.nm) for r in _nm.itertuples() if _pd.notna(r.nm)}
+    # 파이프라인 표시명에도 주입 (PillPipeline._name이 dl_name 컬럼을 사용)
+    db['dm_valid'] = db['dm_valid'].copy()
+    db['dm_valid']['dl_name'] = db['dm_valid']['item_seq'].astype(str).map(NAME_MAP)
+    pipe.backend._dm = db['dm_valid'].set_index('item_seq')
+print(f"약품명 맵 {len(NAME_MAP)}건 (컬럼: {_name_col})")
+
+def pretty_name(seq):
+    return NAME_MAP.get(str(seq)) or f"미확인 약품 ({seq})"
+
+# ── Solar 연결 진단 (APIConnectionError 원인 특정: 네트워크 vs 키 vs 모델) ──
+def solar_ping():
+    import requests as _rq
+    key = os.getenv('UPSTAGE_API_KEY') or ''
+    print(f"UPSTAGE_API_KEY: {'설정됨(' + key[:4] + '…)' if key else '없음'}")
+    try:
+        rr = _rq.get('https://api.upstage.ai/v1/models',
+                     headers={'Authorization': f'Bearer {key}'}, timeout=10)
+        print(f"  엔드포인트 도달: HTTP {rr.status_code} "
+              f"({'인증 OK' if rr.status_code == 200 else '키/권한 확인 필요' if rr.status_code in (401,403) else '응답 이상'})")
+    except Exception as e:
+        print(f"  ⚠️ 엔드포인트 연결 실패: {type(e).__name__} — 네트워크/방화벽 문제(APIConnectionError의 주원인)")
+    try:
+        _r = report_mod.generate_body({'target_drug': {'item_name': '테스트정'},
+            'target_drug_specific_warnings': {}, 'target_permission_information': {}}, 'solar-pro3')
+        print("  ✅ Solar 본문 호출 성공")
+    except Exception as e:
+        print(f"  ⚠️ Solar 호출 실패: {type(e).__name__} — 위 도달성 결과로 네트워크/키/모델 구분")
+
+solar_ping()   # 실패해도 데모는 결정론 폴백으로 동작. 결과로 원인만 특정.
+
+# [셀 G] ★ 리포트 어댑터 (신규) — delivery(2) + 사용자정보 + 동시검출 알약 → 생성기(4)의 5키 payload
+# candidate(성분코드) → active(실제 일치 시) 승격과 개인화 매칭이 여기서 결정된다 (안전 로직)
+import re, time, traceback
+
+SOLAR_MODEL = 'solar-pro3'
+PERMISSION_TABLE = 'drug_permission_info'
+
+def _codes_of(payload):
+    return {str(c) for c in (payload.get('item', {}).get('ingredient_codes') or []) if str(c).strip()}
+
+def _pretty_name(payload):
+    it = payload.get('item', {})
+    return it.get('item_name') or str(it.get('item_seq'))
+
+def build_payload_cached(seq, cache):
+    seq = str(seq)
+    if seq not in cache:
+        cache[seq] = blp.build_payload(seq)
+    return cache[seq]
+
+# fault-tolerant 씬 러너 — 알약 하나의 OCR/분류가 터져도 나머지는 살린다
+#   (실환경 폰 사진은 배경·조명 때문에 특정 crop에서 예외가 잘 남 → 씬 전체 실패 방지)
+from pill_e2e import bbox_crop as _bbox_crop
+import numpy as _np2, base64 as _base64
+def _b64png(bgr_arr):
+    ok, buf = cv2.imencode('.png', bgr_arr)
+    return 'data:image/png;base64,' + _base64.b64encode(buf.tobytes()).decode() if ok else ''
+
+_CC = db.get('COLOR_CLASSES') or []
+_SC = db.get('SHAPE_CLASSES') or []
+def _name_at(classes, prob):
+    try:
+        i = int(_np2.argmax(prob))
+        return classes[i] if 0 <= i < len(classes) else '?'
+    except Exception:
+        return '?'
+
+def run_scene_safe(bgr, k=3, det_conf=0.25):
+    boxes = pipe.detector.detect(bgr, det_conf)
+    out = []
+    for i, (cx, cy, bw, bh, dconf) in enumerate(boxes):
+        try:
+            crop = _bbox_crop(bgr, cx, cy, bw, bh)
+            r = pipe.backend.run(crop, k=k)
+            out.append({'pill_idx': len(out),
+                        'bbox': (int(cx - bw / 2), int(cy - bh / 2), int(bw), int(bh)),
+                        'det_conf': dconf, 'ocr_raw': r['ocr_raw'], 'ocr_conf': r['ocr_conf'],
+                        'color': _name_at(_CC, r.get('p_color')),
+                        'shape': _name_at(_SC, r.get('p_shape')),
+                        'topk': r['topk']})
+        except Exception as _e:
+            print(f"[pill {i}] 처리 실패 → 스킵: {type(_e).__name__}: {_e}")
+            traceback.print_exc()
+    return out
+
+# 씬 캐시 + 검출 견고화: 라이브(Gradio 업로드)는 원본과 해상도/EXIF/재인코딩이 달라 스모크보다
+# 알약이 작게/conf 낮게 잡힌다 → det_conf 사다리(0.25→0.15→0.10) + 소형이미지 업스케일 재검출로
+# '가장 많이 검출된' 결과 채택(한 알만 누락되는 과소검출까지 커버). 과잉검출은 STEP2 '이 중에 없음'이 회수.
+import hashlib as _hashlib
+_SCENE_CACHE = {}
+_DET_CONF_LADDER = (0.25, 0.15, 0.10)
+_UPSCALE_MIN_SIDE = 1280
+
+def _recognize(bgr, boxes, k):
+    # 선택된 박스에만 full 파이프라인(분류·OCR·fusion) 1회 — OCR은 여기서만 돈다.
+    out = []
+    for cx, cy, bw, bh, dconf in boxes:
+        try:
+            crop = _bbox_crop(bgr, cx, cy, bw, bh)
+            r = pipe.backend.run(crop, k=k)
+            out.append({'pill_idx': len(out),
+                        'bbox': (int(cx - bw / 2), int(cy - bh / 2), int(bw), int(bh)),
+                        'det_conf': dconf, 'ocr_raw': r['ocr_raw'], 'ocr_conf': r['ocr_conf'],
+                        'color': _name_at(_CC, r.get('p_color')),
+                        'shape': _name_at(_SC, r.get('p_shape')), 'topk': r['topk']})
+        except Exception as _e:
+            print(f"[pill] 처리 실패 → 스킵: {type(_e).__name__}: {_e}")
+            traceback.print_exc()
+    return out
+
+def _detect_scene_robust(bgr, k, tag=''):
+    # ★ 검출(YOLO, GPU라 쌈)만 conf 사다리로 돌려 '가장 많이 잡힌' 박스를 채택하고,
+    #   비싼 OCR은 채택 박스에만 1회. (예전엔 사다리마다 OCR 전체를 돌려 3~4배 느렸음)
+    H, W = bgr.shape[:2]
+    best = pipe.detector.detect(bgr, _DET_CONF_LADDER[0])
+    for dc in _DET_CONF_LADDER[1:]:
+        if len(best) >= 1:   # 첫 패스에서 잡혔으면 조기 종료(대부분의 정상 사진)
+            break
+        b = pipe.detector.detect(bgr, dc)
+        if len(b) > len(best):
+            best = b
+    src, sc = bgr, 1.0
+    if len(best) < 2 and min(H, W) < _UPSCALE_MIN_SIDE:   # 멀리/작게 찍힌 사진: 업스케일 재검출
+        sc = _UPSCALE_MIN_SIDE / float(min(H, W))
+        big = cv2.resize(bgr, (int(W * sc), int(H * sc)), interpolation=cv2.INTER_CUBIC)
+        for dc in _DET_CONF_LADDER:
+            b = pipe.detector.detect(big, dc)
+            if len(b) > len(best):
+                best, src = b, big
+    print(f"[detect{tag}] 검출 {len(best)}개 (scale x{sc:.2f}) — OCR은 이 {len(best)}개에만 1회")
+    res = _recognize(src, best, k)
+    if src is not bgr:   # 업스케일 좌표 → 원본 해상도 복원(시각화·썸네일 정합)
+        for r in res:
+            bx, by, bw2, bh2 = r['bbox']
+            r['bbox'] = (int(bx / sc), int(by / sc), int(bw2 / sc), int(bh2 / sc))
+    return res
+
+def run_scene_cached(image_path, k=3):
+    with open(image_path, 'rb') as _f:
+        key = _hashlib.md5(_f.read()).hexdigest()
+    if key in _SCENE_CACHE:
+        return _SCENE_CACHE[key]
+    bgr = load_scene_bgr(image_path)
+    res = _detect_scene_robust(bgr, k=k, tag=' ' + os.path.basename(str(image_path)))
+    _SCENE_CACHE[key] = (bgr, res)
+    return bgr, res
+
+# ── 이슈 B: 후보 약의 실제 참조 이미지 (식약처 낱알식별 API) — 일반인은 이름만으론 못 고른다 ──
+# NALAL_API_KEY(Colab Secrets, 선택)가 있으면 item_seq→ITEM_IMAGE URL 조회·캐시. 없으면 이미지 생략(이름만 표시).
+import requests as _requests
+NALAL_API_KEY = os.getenv('NALAL_API_KEY')   # data.go.kr 낱알식별(15057639) '일반 인증키(Decoding)'
+_IMG_URL_CACHE = {}
+_NALAL_EP = 'http://apis.data.go.kr/1471000/MdcinGrnIdntfcInfoService01/getMdcinGrnIdntfcInfoList01'
+def candidate_image_url(item_seq):
+    seq = str(item_seq)
+    if seq in _IMG_URL_CACHE:
+        return _IMG_URL_CACHE[seq]
+    url = None
+    if NALAL_API_KEY:
+        try:
+            r = _requests.get(_NALAL_EP, timeout=6, params={
+                'serviceKey': NALAL_API_KEY, 'item_seq': seq, 'type': 'json', 'numOfRows': 1})
+            def _find(o):
+                if isinstance(o, dict):
+                    for kk, vv in o.items():
+                        if kk.upper() == 'ITEM_IMAGE' and vv:
+                            return str(vv)
+                        f = _find(vv)
+                        if f:
+                            return f
+                elif isinstance(o, list):
+                    for x in o:
+                        f = _find(x)
+                        if f:
+                            return f
+                return None
+            url = _find(r.json())
+        except Exception as _e:
+            print(f"[낱알이미지] {seq} 조회 실패: {type(_e).__name__}")
+    _IMG_URL_CACHE[seq] = url
+    return url
+
+# ── (a) 병용 활성화: candidate의 상대 성분코드가 '다른 약'(동시검출+보유약) 성분코드와 일치할 때만 active ──
+def build_active_warnings(delivery, other_payloads):
+    # 같은 금기 성분을 가진 다른 약이 여러 개면 전부 경고 (break 없이 전 조합, (성분,상대약) 중복만 제거)
+    active, seen = [], set()
+    cands = (delivery.get('multi_drug_information') or {}).get('concomitant_candidates') or []
+    for c in cands:
+        code = str(c.get('contraindicated_ingredient_code') or '').strip()
+        if not code:
+            continue
+        for pl in other_payloads:
+            if code in _codes_of(pl):
+                key = (code, _pretty_name(pl))
+                if key in seen:
+                    continue
+                seen.add(key)
+                active.append({
+                    'other_drug': {'item_name': _pretty_name(pl)},
+                    'risks': list(c.get('risks') or []),
+                })
+    return active
+
+# ── (b) 개인화: 이 약의 연령 기준·임부 등급 ↔ 사용자 나이·임신 ──
+_AGE_PAT = re.compile(r'(?:만\s*)?(\d+)\s*세\s*(이하|미만|이상|초과)')
+
+def _age_matches(age, standard_text):
+    m = _AGE_PAT.search(str(standard_text or ''))
+    if not m:
+        return False   # 파싱 불가 시 보수적으로 미포함 (데모 범위 규칙 — 한계로 문서화)
+    n, rel = int(m.group(1)), m.group(2)
+    return {'이하': age <= n, '미만': age < n, '이상': age >= n, '초과': age > n}[rel]
+
+def build_personalized_cautions(dur_info, age, pregnant):
+    cautions = []
+    for w in (dur_info.get('direct_warnings') or []):
+        if pregnant and w.get('pregnancy_grade'):
+            cautions.append({
+                'caution_family': 'PREGNANCY',
+                'source_text': w.get('content') or '',
+                'matched_user_value': '임신 중',
+                'user_severity_known': False,
+            })
+        if age is not None and w.get('age_standard') and _age_matches(int(age), w.get('age_standard')):
+            cautions.append({
+                'caution_family': 'AGE',
+                'source_text': w.get('content') or '',
+                'matched_user_value': f'{int(age)}세',
+                'user_severity_known': False,
+            })
+    return cautions
+
+# ── (c) 이름 입력 보유약 → drug_master 매칭 (선택 기능, dl_name 부분일치 첫 건) ──
+def resolve_inventory_names(text_input, dm_valid):
+    pairs = []
+    if not text_input or 'dl_name' not in dm_valid.columns:
+        return pairs
+    for raw in str(text_input).split(','):
+        name = raw.strip()
+        if not name:
+            continue
+        hit = dm_valid[dm_valid['dl_name'].astype(str).str.contains(re.escape(name), na=False)]
+        if len(hit):
+            pairs.append((name, str(hit.iloc[0]['item_seq'])))
+    return pairs
+
+# ── 어댑터 본체: 리포트 5키 payload 조립 ──
+import json as _json
+
+def assemble_report_payload(target_seq, all_payloads, user_meta):
+    target_seq = str(target_seq)
+    delivery = build_delivery_item(payload=all_payloads[target_seq], engine=engine,
+                                   permission_table=PERMISSION_TABLE)
+    others = [p for s, p in all_payloads.items() if s != target_seq]
+    payload = {
+        'target_drug': delivery['drug'],
+        'target_drug_specific_warnings': delivery['dur_information'],
+        'target_permission_information': delivery['permission_information'],
+        'inventory_interaction_check': {
+            'active_concomitant_warnings': build_active_warnings(delivery, others)},
+        'personalization': {
+            'personalized_cautions': build_personalized_cautions(
+                delivery['dur_information'], user_meta.get('age'), user_meta.get('pregnant'))},
+    }
+    if not payload['target_drug'].get('item_name'):
+        payload['target_drug']['item_name'] = NAME_MAP.get(target_seq)
+    # ★ DB 원값(Decimal/datetime 등)이 남아 있으면 generate_body 내부 json.dumps가
+    #   default=str 없이 죽는다(전 품목 LLM 실패의 원인) → JSON 왕복으로 전 타입 정규화
+    payload = _json.loads(_json.dumps(payload, ensure_ascii=False, default=str))
+    return payload, delivery
+
+
+# ── LLM 실패/허가정보 부재 시에도 알맹이 있는 본문: 허가 원문 기반 결정론적 렌더 ──
+# 금기·경고 성격의 조항 → 리드로 우선 노출(신뢰도 확보)
+_CONTRA_PAT = ('투여하지 말', '투여하지 마', '투여해서는 안', '사용하지 말', '사용해서는 안',
+               '복용하지 말', '금기', '금지', '하지 말 것', '해서는 안', '경고', '중대한', '치명', '주의를 요')
+
+def _sentences(t):
+    t = ' '.join(str(t).split())
+    if not t:
+        return []
+    # 문장부호(.!?) 또는 "1) / 2." 같은 번호 항목 경계로 분할
+    raw = re.split(r'(?<=[.!?。])\s+|(?=\s\d+[).]\s)', t)
+    return [s.strip(' ·-,') for s in raw if s and s.strip(' ·-,')]
+
+def render_long(text, summary='전체 원문 펼쳐보기', lead=2, short_len=180):
+    # 긴 원문을 정보 손실 없이: (리드 몇 문장) + <details>전체 원문</details>. 기본 접힘.
+    t = ' '.join(str(text).split())
+    if not t:
+        return ''
+    if len(t) <= short_len:
+        return t
+    sents = _sentences(t)
+    if len(sents) <= 1:
+        # 문장 분리 실패(단일 덩어리) → 통째로 접이식
+        return ('<details>\n<summary>' + summary + '</summary>\n\n' + t + '\n\n</details>')
+    lead_sents = []
+    for s in sents:                       # 금기·경고 조항을 먼저
+        if any(k in s for k in _CONTRA_PAT) and s not in lead_sents:
+            lead_sents.append(s)
+        if len(lead_sents) >= 2:
+            break
+    for s in sents[:lead]:                # 이어서 서두 문장
+        if s not in lead_sents:
+            lead_sents.append(s)
+        if len(lead_sents) >= lead + 2:
+            break
+    lead_block = ' '.join(lead_sents[:3])
+    return (lead_block + '\n\n'
+            + '<details>\n<summary>' + summary + '</summary>\n\n'
+            + t + '\n\n</details>')
+
+def render_basic_body(delivery, seq):
+    drug = delivery.get('drug') or {}
+    perm = delivery.get('permission_information') or {}
+    pt = perm.get('permission_text') or {}
+    dur = delivery.get('dur_information') or {}
+    name = drug.get('item_name') or pretty_name(seq)
+    out = ['## 3. 의약품 기본정보']
+    basic = ' · '.join(x for x in [name, drug.get('company_name'), drug.get('product_form')] if x)
+    out.append(basic or '기본정보가 등록되어 있지 않습니다.')
+    ings = ', '.join(drug.get('ingredient_names') or [])
+    if ings:
+        out.append(f"주성분: {ings}")
+    if not pt:
+        out.append('## 4~7. 상세 정보')
+        out.append('식약처 허가정보 DB에서 이 약의 상세 정보를 찾지 못했습니다. '
+                   '식별 결과가 맞는지 포장의 표기와 대조하고, 효능·복용법은 약사에게 확인해 주세요.')
+        return '\n\n'.join(out)
+    for key, title, summ in [('efficacy', '## 4. 효능·효과', '효능·효과 전체 보기'),
+                             ('dosage', '## 5. 복용방법', '복용방법 전체 보기')]:
+        if pt.get(key):
+            out.append(title)
+            out.append(render_long(pt[key], summary=summ, lead=2))
+    warns = []
+    for w in (dur.get('direct_warnings') or [])[:5]:
+        c = w.get('content')
+        if not c:
+            continue
+        rl = render_long(c, summary='이 경고 전체 보기', lead=1)
+        warns.append(rl if rl.startswith('<details') else '- ' + rl)
+    if warns or pt.get('precautions'):
+        out.append('## 6. DUR 및 주요 주의사항')
+        out.extend(warns)
+        if pt.get('precautions'):
+            out.append('**사용상의 주의사항**')
+            out.append(render_long(pt['precautions'], summary='전체 주의사항 펼쳐보기', lead=2))
+    if pt.get('storage_method') or pt.get('valid_term'):
+        out.append('## 7. 보관방법')
+        out.append(' / '.join(x for x in [pt.get('storage_method'), pt.get('valid_term')] if x))
+    out.append('*(허가정보 원문 기반 자동 정리 — 접힌 항목을 펼치면 원문 전체를 볼 수 있습니다. '
+               '쉬운 설명이 필요하면 약사에게 문의해 주세요)*')
+    return '\n\n'.join(out)
+
+# ── 리포트 생성: Solar 재시도(지수백오프) → 실패 시 허가원문 기반 결정론 본문으로 폴백 ──
+def generate_report_safe(payload, delivery, seq, model=SOLAR_MODEL, max_retry=2):
+    payload.setdefault('inventory_interaction_check', {'active_concomitant_warnings': []})
+    payload.setdefault('personalization', {'personalized_cautions': []})
+    body, last_err = None, None
+    for i in range(max_retry + 1):
+        try:
+            body, _ = report_mod.generate_body(payload, model)
+            break
+        except Exception as e:
+            last_err = e
+            print(f"[Solar 재시도 {i + 1}/{max_retry + 1}] {type(e).__name__}: {e}")
+            time.sleep(2 ** i)
+    if last_err and body is None:
+        traceback.print_exc()   # 서버 콘솔에 전체 원인 기록 (사용자 화면엔 미노출)
+    title = payload['target_drug'].get('item_name') or pretty_name(seq)
+    sections = [f"# {title} 복약지도서",
+                report_mod.render_interaction_section(payload)]
+    _ps = report_mod.render_personalization_section(payload)
+    if _ps:
+        sections.append(_ps)
+    sections.append(body if body else render_basic_body(delivery, seq))
+    sections.append(report_mod.render_check_section(payload))
+    sections.append("본 안내는 입력된 의약품 정보, DUR 데이터 및 사용자가 등록한 정보를 바탕으로 "
+                    "생성되었으며, 의료전문가의 판단을 대체하지 않습니다.")
+    report = "\n\n".join(s.strip() for s in sections if s and s.strip())
+    return report, (None if body else last_err)
+
+# 순수 함수 즉석 자기검증
+assert _age_matches(75, '만 65세 이상') and not _age_matches(50, '만 65세 이상')
+assert _age_matches(10, '12세 미만') and not _age_matches(12, '12세 미만')
+_fake = {'direct_warnings': [{'pregnancy_grade': '2등급', 'content': '임부 금기', 'age_standard': None}]}
+assert build_personalized_cautions(_fake, 30, True)[0]['caution_family'] == 'PREGNANCY'
+assert build_personalized_cautions(_fake, 30, False) == []
+print("어댑터 정의 + 자기검증 OK")
+
+
+# =========================
+# FINAL REPORT-ONLY DEMO OVERRIDES
+# 검출 함수(_detect_scene_robust/run_scene_cached)는 원본 그대로 둔다.
+# 여기서는 후보 이미지 경로, 개인DB 저장, 상단 안전 체크, 개별 보고서 출력만 덮어쓴다.
+# =========================
+
+import os as _os_report
+import base64 as _base64_report
+import mimetypes as _mimetypes_report
+from sqlalchemy import inspect as _sa_inspect, text as _sqltext
+
+PERSONAL_TABLE = 'personal_medication'
+PERSONAL_USER_ID = 'demo_user'
+LOCAL_CANDIDATE_REF_DIRS = [
+    '/content/drive/MyDrive/pillot/candidate_ref',
+    '/content/candidate_refs',
+    f'{FT}/candidate_refs',
+]
+
+def _image_file_to_data_uri(path):
+    mime = _mimetypes_report.guess_type(path)[0] or 'image/jpeg'
+    with open(path, 'rb') as f:
+        b64 = _base64_report.b64encode(f.read()).decode()
+    return f'data:{mime};base64,{b64}'
+
+def candidate_image_url(item_seq):
+    seq = str(item_seq)
+    for base_dir in LOCAL_CANDIDATE_REF_DIRS:
+        for ext in ['.png', '.jpg', '.jpeg', '.webp']:
+            local_path = _os_report.path.join(base_dir, f'{seq}{ext}')
+            if _os_report.path.exists(local_path):
+                return _image_file_to_data_uri(local_path)
+
+    if seq in _IMG_URL_CACHE:
+        return _IMG_URL_CACHE[seq]
+
+    url = None
+    if NALAL_API_KEY:
+        try:
+            r = _requests.get(_NALAL_EP, timeout=6, params={
+                'serviceKey': NALAL_API_KEY,
+                'item_seq': seq,
+                'type': 'json',
+                'numOfRows': 1,
+            })
+
+            def _find(o):
+                if isinstance(o, dict):
+                    for kk, vv in o.items():
+                        if kk.upper() == 'ITEM_IMAGE' and vv:
+                            return str(vv)
+                        found = _find(vv)
+                        if found:
+                            return found
+                elif isinstance(o, list):
+                    for x in o:
+                        found = _find(x)
+                        if found:
+                            return found
+                return None
+
+            url = _find(r.json())
+        except Exception as _e:
+            print(f"[낱알이미지] {seq} 조회 실패: {type(_e).__name__}")
+
+    _IMG_URL_CACHE[seq] = url
+    return url
+
+def build_personalized_cautions(dur_info, permission_info, age, pregnant):
+    cautions = []
+
+    for w in (dur_info.get('direct_warnings') or []):
+        if pregnant and w.get('pregnancy_grade'):
+            cautions.append({
+                'caution_family': 'PREGNANCY',
+                'source_text': w.get('content') or '',
+                'matched_user_value': '임신 중이거나 가능성 있음',
+                'user_severity_known': False,
+            })
+
+        if age is not None and w.get('age_standard') and _age_matches(int(age), w.get('age_standard')):
+            cautions.append({
+                'caution_family': 'AGE',
+                'source_text': w.get('content') or '',
+                'matched_user_value': f'{int(age)}세',
+                'user_severity_known': False,
+            })
+
+    pt = (permission_info or {}).get('permission_text') or {}
+    precautions = str(pt.get('precautions') or '')
+
+    if pregnant and any(k in precautions for k in ['임부', '임신', '임신가능성', '수유부']):
+        cautions.append({
+            'caution_family': 'PREGNANCY',
+            'source_text': '허가정보에 임신 또는 수유 관련 주의사항이 있습니다.',
+            'matched_user_value': '임신 중이거나 가능성 있음',
+            'user_severity_known': False,
+        })
+
+    if age is not None and int(age) >= 65 and any(k in precautions for k in ['고령자', '65세 이상', '노인']):
+        cautions.append({
+            'caution_family': 'AGE',
+            'source_text': '허가정보에 고령자 관련 주의사항이 있습니다.',
+            'matched_user_value': f'{int(age)}세',
+            'user_severity_known': False,
+        })
+
+    return cautions
+
+def assemble_report_payload(target_seq, all_payloads, user_meta):
+    target_seq = str(target_seq)
+    delivery = build_delivery_item(
+        payload=all_payloads[target_seq],
+        engine=engine,
+        permission_table=PERMISSION_TABLE,
+    )
+    others = [p for s, p in all_payloads.items() if s != target_seq]
+    payload = {
+        'target_drug': delivery['drug'],
+        'target_drug_specific_warnings': delivery['dur_information'],
+        'target_permission_information': delivery['permission_information'],
+        'inventory_interaction_check': {
+            'active_concomitant_warnings': build_active_warnings(delivery, others),
+        },
+        'personalization': {
+            'personalized_cautions': build_personalized_cautions(
+                delivery['dur_information'],
+                delivery['permission_information'],
+                user_meta.get('age'),
+                user_meta.get('pregnant'),
+            ),
+        },
+    }
+    if not payload['target_drug'].get('item_name'):
+        payload['target_drug']['item_name'] = NAME_MAP.get(target_seq)
+    payload = _json.loads(_json.dumps(payload, ensure_ascii=False, default=str))
+    return payload, delivery
+
+def _table_exists(name):
+    try:
+        return _sa_inspect(engine).has_table(name)
+    except Exception as e:
+        print(f"[personal db] 테이블 확인 실패: {type(e).__name__}: {e}")
+        return False
+
+def load_active_personal_meds(user_id=PERSONAL_USER_ID, exclude_seqs=None):
+    exclude_seqs = {str(x) for x in (exclude_seqs or [])}
+    if not _table_exists(PERSONAL_TABLE):
+        return []
+
+    with engine.connect() as conn:
+        rs = conn.execute(_sqltext(f"""
+            SELECT CAST(item_seq AS CHAR) AS item_seq, item_name, company_name
+            FROM `{PERSONAL_TABLE}`
+            WHERE user_id = :user_id
+              AND medication_status = 'ACTIVE'
+        """), {'user_id': user_id})
+        rows = [dict(r) for r in rs.mappings()]
+
+    return [r for r in rows if str(r.get('item_seq')) not in exclude_seqs]
+
+def _drug_basic(seq):
+    seq = str(seq)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(_sqltext("""
+                SELECT CAST(item_seq AS CHAR) AS item_seq,
+                       MAX(dl_name) AS item_name,
+                       MAX(dl_company) AS company_name
+                FROM drug_master
+                WHERE CAST(item_seq AS CHAR) = :seq
+                GROUP BY item_seq
+                LIMIT 1
+            """), {'seq': seq}).mappings().first()
+        if row:
+            return dict(row)
+    except Exception as e:
+        print(f"[drug basic] {seq} 조회 실패: {type(e).__name__}: {e}")
+    return {'item_seq': seq, 'item_name': pretty_name(seq), 'company_name': None}
+
+def register_selected_personal_meds(selected_seqs, user_id=PERSONAL_USER_ID):
+    if not _table_exists(PERSONAL_TABLE):
+        return {'status': 'SKIPPED_TABLE_NOT_FOUND', 'count': 0}
+
+    count = 0
+    try:
+        with engine.begin() as conn:
+            for seq in selected_seqs:
+                d = _drug_basic(seq)
+                conn.execute(_sqltext(f"""
+                    INSERT INTO `{PERSONAL_TABLE}` (
+                        user_id, item_seq, item_name, company_name,
+                        medication_status, identification_source, confirmed_by_user
+                    )
+                    VALUES (
+                        :user_id, :item_seq, :item_name, :company_name,
+                        'ACTIVE', 'IMAGE', 1
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        item_name = VALUES(item_name),
+                        company_name = VALUES(company_name),
+                        medication_status = 'ACTIVE',
+                        identification_source = VALUES(identification_source),
+                        confirmed_by_user = 1,
+                        ended_at = NULL
+                """), {
+                    'user_id': user_id,
+                    'item_seq': str(seq),
+                    'item_name': d.get('item_name'),
+                    'company_name': d.get('company_name'),
+                })
+                count += 1
+        return {'status': 'REGISTERED', 'count': count}
+    except Exception as e:
+        print(f"[personal db] 저장 실패: {type(e).__name__}: {e}")
+        return {'status': f'FAILED_{type(e).__name__}', 'count': count}
+
+def render_global_safety_report(selected_seqs, all_payloads, user_meta, existing_meds, register_result):
+    lines = ['# 오늘의 복약 안전 체크', '']
+    lines.append('사진에서 확인한 약들을 기준으로, 함께 먹어도 되는지와 사용자 정보에 맞는 주의사항을 먼저 확인했어요.')
+    lines.append('')
+
+    deliveries = {
+        str(seq): build_delivery_item(
+            payload=all_payloads[str(seq)],
+            engine=engine,
+            permission_table=PERMISSION_TABLE,
+        )
+        for seq in selected_seqs
+    }
+
+    def _drug_name(seq):
+        return deliveries[str(seq)]['drug'].get('item_name') or pretty_name(seq)
+
+    def _risk_text(w):
+        risks = [str(x).strip() for x in (w.get('risks') or []) if str(x).strip()]
+        return '; '.join(risks) if risks else '병용금기 정보가 확인되었습니다.'
+
+    lines.append('## 1. 이번 사진 속 약들끼리')
+    pair_lines = []
+    seen = set()
+
+    for seq in selected_seqs:
+        seq = str(seq)
+        others = [all_payloads[str(o)] for o in selected_seqs if str(o) != seq]
+        for w in build_active_warnings(deliveries[seq], others):
+            a = _drug_name(seq)
+            b = (w.get('other_drug') or {}).get('item_name') or '다른 선택 약'
+            key = tuple(sorted([a, b]))
+            if key in seen:
+                continue
+            seen.add(key)
+            pair_lines.append(
+                f'- **주의 필요:** {a}와 {b}는 함께 복용 전 약사 확인이 필요해요.\n'
+                f'  - 근거: {_risk_text(w)}'
+            )
+
+    if pair_lines:
+        lines.extend(pair_lines)
+    else:
+        lines.append('- 현재 데이터 기준으로, 이번 사진에서 선택한 약들끼리 확인된 병용금기는 없어요.')
+        lines.append('- 단, 실제 처방 의도나 복용량에 따라 달라질 수 있어 약사 확인은 권장돼요.')
+
+    lines.append('')
+    lines.append('## 2. 기존 복용약과 새로 확인한 약')
+    personal_lines = []
+
+    existing_payloads = []
+    for med in existing_meds:
+        seq = str(med.get('item_seq'))
+        try:
+            build_payload_cached(seq, all_payloads)
+            existing_payloads.append(all_payloads[seq])
+        except Exception as e:
+            personal_lines.append(
+                f"- {med.get('item_name') or seq}: 정보를 불러오지 못했어요. "
+                f"약사에게 직접 확인해 주세요. ({type(e).__name__})"
+            )
+
+    for seq in selected_seqs:
+        seq = str(seq)
+        for w in build_active_warnings(deliveries[seq], existing_payloads):
+            a = _drug_name(seq)
+            b = (w.get('other_drug') or {}).get('item_name') or '기존 복용약'
+            personal_lines.append(
+                f'- **주의 필요:** 새로 확인한 {a}와 기존 복용약 {b}의 병용을 확인해 주세요.\n'
+                f'  - 근거: {_risk_text(w)}'
+            )
+
+    if not existing_meds:
+        personal_lines.append('- 기존 복용약으로 등록된 약이 없어, 이번에 선택한 약들만 기준으로 확인했어요.')
+    elif not personal_lines:
+        personal_lines.append('- 기존 복용약과 새로 확인한 약 사이에서 확인된 병용금기는 없어요.')
+        personal_lines.append('- 그래도 실제 복용 중인 약이 더 있다면 약사에게 함께 보여 주세요.')
+
+    lines.extend(personal_lines)
+
+    lines.append('')
+    lines.append('## 3. 나이·임신 여부로 더 확인할 점')
+    caution_lines = []
+    seen_cautions = set()
+
+    for seq in selected_seqs:
+        pl, _dv = assemble_report_payload(str(seq), all_payloads, user_meta)
+        name = pl['target_drug'].get('item_name') or pretty_name(seq)
+        for c in (pl.get('personalization') or {}).get('personalized_cautions') or []:
+            family = c.get('caution_family')
+            label = c.get('matched_user_value') or family or '사용자 정보'
+            key = (name, family, label)
+            if key in seen_cautions:
+                continue
+            seen_cautions.add(key)
+            if family == 'AGE':
+                msg = f'{label} 기준으로 **{name}**은(는) 고령자 주의사항이 있어요. 어지러움, 졸림, 속불편감 같은 이상반응이 있으면 약사에게 알려 주세요.'
+            elif family == 'PREGNANCY':
+                msg = f'{label}인 경우 **{name}**은(는) 임신·수유 관련 주의사항이 있어요. 복용 전 의사 또는 약사에게 꼭 확인해 주세요.'
+            else:
+                src = c.get('source_text') or '관련 주의사항이 있습니다.'
+                msg = f'**{name}**: {label}와 관련해 확인이 필요해요. {src}'
+            caution_lines.append(f'- {msg}')
+
+    if caution_lines:
+        lines.extend(caution_lines)
+    else:
+        lines.append('- 입력한 나이와 임신 여부 기준으로 특별히 강조할 주의사항은 확인되지 않았어요.')
+
+    lines.append('')
+    lines.append('## 4. 내 복용약 목록')
+    if register_result.get('status') == 'REGISTERED':
+        lines.append(f"- 선택한 약 {register_result.get('count', 0)}개를 내 복용약 목록에 저장했어요.")
+    elif register_result.get('status') == 'SKIPPED_TABLE_NOT_FOUND':
+        lines.append('- 내 복용약 목록 저장 기능은 아직 준비되지 않았어요. 이번 안내는 선택한 약 기준으로만 만들었어요.')
+    else:
+        lines.append('- 내 복용약 목록 저장 중 문제가 있었어요. 그래도 이번 안내는 선택한 약 기준으로 만들었어요.')
+
+    lines.append('')
+    lines.append('> 이 안내는 자동 확인 결과예요. 실제 복용 전에는 약 봉투나 처방전과 함께 약사에게 한 번 더 확인해 주세요.')
+    return '\n'.join(lines)
+
+def generate_report_safe(payload, delivery, seq, model=SOLAR_MODEL, max_retry=2):
+    body, last_err = None, None
+    for i in range(max_retry + 1):
+        try:
+            body, _ = report_mod.generate_body(payload, model)
+            break
+        except Exception as e:
+            last_err = e
+            print(f"[Solar 재시도 {i + 1}/{max_retry + 1}] {type(e).__name__}: {e}")
+            time.sleep(2 ** i)
+    if last_err and body is None:
+        traceback.print_exc()
+    title = payload['target_drug'].get('item_name') or pretty_name(seq)
+    sections = [
+        f"# {title} 복약지도서",
+        body if body else render_basic_body(delivery, seq),
+        "※ 아래 내용은 식약처 허가정보와 DUR 데이터를 쉽게 정리한 참고용 안내입니다.",
+    ]
+    report = '\n\n'.join(s.strip() for s in sections if s and s.strip())
+    return report, (None if body else last_err)
+
+print('REPORT-ONLY DEMO OVERRIDES OK')
+
+# [셀 H] 자가검증 — 대표 3장으로 라이브(셀 I)와 동일 경로 검증 + 캐시 프리웜
+import time as _t
+
+# 스모크 대상 3장(스템 매칭, 미매칭 시 전체 폴백): 단일·조합·실환경 폰 사진
+_SMOKE_ONLY = ['Demo_Single_1', 'Demo_Combination_2', 'Demo_Phone_Cam_2']
+_smoke_scenes = [p for p in demo_scenes
+                 if os.path.splitext(os.path.basename(p))[0] in _SMOKE_ONLY] or demo_scenes
+
+print("=" * 70)
+print(f"1) 스모크 {len(_smoke_scenes)}장(라이브와 동일 run_scene_cached 경로): 검출 → OCR → top-3")
+print("=" * 70)
+smoke = {}
+for _p in _smoke_scenes:
+    _name = os.path.basename(_p)
+    _t0 = _t.time()
+    _bgr, _res = run_scene_cached(_p, k=3)   # 라이브(셀 I)와 동일 경로로 검증 + 캐시 프리웜
+    _dt = _t.time() - _t0
+    smoke[_name] = _res
+    print(f"[{_name}] 검출 {len(_res)}개 | {_dt:.1f}s | 알약당 {_dt / max(len(_res), 1):.1f}s")
+    for _r in _res:
+        _tops = ' / '.join(f"{_x['name']}({_x['item_seq']})" for _x in _r['topk'])
+        print(f"   #{_r['pill_idx']} det {_r['det_conf']:.2f} OCR '{_r['ocr_raw']}' ({_r['ocr_conf']:.2f}) → {_tops}")
+
+_fails = [n for n, r in smoke.items() if not r]
+print("⚠️ 검출 0건:", _fails, "— 원인 분석 필요") if _fails else print("✅ 8/8 검출 통과")
+print("(알약당 15s 초과가 많으면 셀 D의 OCR_MODE='fast' 후 셀 E 재실행 권장)")
+
+print()
+print("=" * 70)
+print("2) 풀 e2e 1건: 다중 알약 씬 → top-1 선택 → 교차 병용검사 → 지도서 생성")
+print("=" * 70)
+def _has_topk(res):
+    return bool(res) and any(_r['topk'] for _r in res)
+
+_scene_name = next((n for n in smoke if 'Combination' in n and len(smoke[n]) >= 2 and _has_topk(smoke[n])),
+                   next((n for n in smoke if _has_topk(smoke[n])), None))
+assert _scene_name, "e2e 검증 가능한 씬 없음 (검출됐어도 top-k 후보 0) — 후보 압축/drug_master 확인"
+_res = smoke[_scene_name]
+_sel = [str(_r['topk'][0]['item_seq']) for _r in _res if _r['topk']]
+assert _sel, f"{_scene_name}: top-k 후보 없음"
+print(f"씬 {_scene_name}: 알약 {len(_res)}개, top-1 선택 = {_sel}")
+
+_cache = {}
+for _s in dict.fromkeys(_sel):
+    build_payload_cached(_s, _cache)
+_meta = {'age': 75, 'pregnant': False}   # 가상 페르소나 (연령 개인화 경로 확인용)
+_pl, _dv = assemble_report_payload(_sel[0], _cache, _meta)
+for _k in ['target_drug', 'target_drug_specific_warnings', 'target_permission_information',
+           'inventory_interaction_check', 'personalization']:
+    assert _k in _pl, _k
+import json as _j
+_j.dumps(_pl)   # 직렬화 무결성 (Decimal/datetime 잔존 시 여기서 즉시 검출)
+print("5키 payload + 직렬화 OK | 활성 병용:", len(_pl['inventory_interaction_check']['active_concomitant_warnings']),
+      "| 개인화 매칭:", len(_pl['personalization']['personalized_cautions']))
+
+_report, _err = generate_report_safe(_pl, _dv, _sel[0])
+print("Solar 본문:", "성공" if _err is None else f"실패(결정론 폴백 동작 확인): {type(_err).__name__}")
+print("-" * 70)
+print(_report[:1500])
+print("..." if len(_report) > 1500 else "")
+
+print()
+print("=" * 70)
+print("3) 약사 확인 경로 미리보기 — 알약별 각인·색·모양 + DB 매칭 여부")
+print("=" * 70)
+_phone = [n for n in smoke if 'Phone' in n] or list(smoke)
+for _nm in _phone:
+    print(f"\n[{_nm}]")
+    for _r in smoke[_nm]:
+        _has = bool(_r['topk'])
+        _flag = "→ 식별 후보 있음" if _has else "→ DB 후보 0건 · 약사 확인"
+        _cand = ', '.join(pretty_name(t['item_seq']) for t in _r['topk']) or '없음'
+        print(f"  #{_r['pill_idx']} 색·모양 {_r.get('color','?')}/{_r.get('shape','?')} "
+              f"· 각인 '{_r['ocr_raw'] or '없음'}' {_flag}")
+        print(f"       top-3: {_cand}")
+print("\n  ↳ 실제 데모에선 top-3가 실제 약과 다르면 '이 중에 없음'을 눌러 약사 확인 카드로 넘어갑니다.")
+print()
+print("✅ 자가검증 완료 — [데모 파트] 실행 가능")
+
+"""## [데모 파트] — 발표장에서는 아래 셀만 실행 (준비 파트가 같은 세션에서 완료된 상태여야 함)"""
+
+# [셀 I] Gradio 웹 데모 기동 — 3단계 위저드 (정보 입력 → 후보 확인 → 지도서)
+# 보안: 시크릿은 env로만, 예외 메시지에 경로/키/스택트레이스 미노출, 업로드 이미지 미보존
+import gradio as gr
+import numpy as _np
+from PIL import ImageDraw, ImageFont
+
+MAX_PILLS = 8
+
+CSS = ('.gradio-container{max-width:600px!important;margin:0 auto!important;} '
+       '#hdr{background:#1A2B5C;border-radius:16px;padding:16px 20px;margin-bottom:4px;} '
+       '#hdr h1{color:#fff;font-size:21px;margin:0;} '
+       '#hdr p{color:#CADCFC;font-size:12.5px;margin:4px 0 0;} '
+       '.step-tag{color:#1A2B5C;font-weight:700;font-size:13px;letter-spacing:1px;} '
+       '.pill-thumb img{border-radius:14px;object-fit:cover;} '
+       'button.primary,.primary{background:#1A2B5C!important;border:none!important;} '
+       '.gr-button{border-radius:12px!important;} '
+       '@keyframes pillspin{to{transform:rotate(360deg);}} '
+       '@keyframes pillpulse{0%,100%{opacity:1;}50%{opacity:.45;}} '
+       '.loadbox{text-align:center;padding:30px 0 24px;} '
+       '.pillspin{display:inline-block;font-size:52px;line-height:1;'
+       'animation:pillspin 1.3s linear infinite;} '
+       '.loadmsg{color:#1A2B5C;font-weight:700;font-size:16px;margin:14px 0 6px;} '
+       '.loaddot{color:#1A2B5C;animation:pillpulse 1.3s ease-in-out infinite;} '
+       '.loadsub{color:#6B7280;font-size:12.5px;margin:0;line-height:1.5;} '
+       '.report-banner{display:flex;align-items:center;gap:14px;background:#EEF3FF;'
+       'border:1.5px solid #1A2B5C;border-radius:14px;padding:14px 16px;margin:2px 0 18px;} '
+       '.report-banner .docspin{font-size:34px;line-height:1;flex:0 0 auto;display:inline-block;'
+       'animation:pillspin 2.2s linear infinite;transform-origin:50% 50%;} '
+       '.report-banner-txt{color:#1A2B5C;font-size:13px;line-height:1.55;font-weight:500;} '
+       '.candrow{display:flex;gap:8px;margin:6px 0 2px;flex-wrap:wrap;} '
+       '.candcell{flex:1 1 0;min-width:90px;text-align:center;} '
+       '.candimg{width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:10px;'
+       'border:1px solid #D5DEEA;background:#F6F9FD;} '
+       '.candnoimg{display:flex;align-items:center;justify-content:center;color:#9AA3AF;font-size:11px;} '
+       '.candnm{font-size:12px;font-weight:600;color:#1F2430;margin-top:4px;line-height:1.25;} '
+       '.candpct{font-size:11px;color:#6B7280;} '
+       'footer{display:none!important;}')
+
+def _loading(msg, emoji='💊'):
+    # 처리 중 대기 화면: 회전 이모지 + 참고용 안내 (기본 💊, 리포트 생성 단계는 의사 🧑‍⚕️)
+    return ('<div class="loadbox">'
+            f'<div class="pillspin">{emoji}</div>'
+            f'<p class="loadmsg">{msg}<span class="loaddot"> …</span></p>'
+            '<p class="loadsub">복약 지도는 <b>참고용</b>입니다.<br>'
+            '정확한 복약과 상호작용은 반드시 의사·약사와 상담하세요.</p></div>')
+
+def _report_banner():
+    # 최종 지도서 최상단 면책 배너: 회전하는 의사 이모지 + 참고용·상담 안내
+    return ('<div class="report-banner"><span class="docspin">🧑‍⚕️</span>'
+            '<div class="report-banner-txt">이 복약 안내는 <b>식약처 의약품 허가정보 및 DUR 데이터</b>를 '
+            '바탕으로 자동 생성된 <b>참고용</b> 자료입니다.<br>'
+            '복용 전 반드시 <b>약사·의사와 상담</b>하세요.</div></div>')
+
+def _softmax_pct(scores):
+    a = _np.array(scores, dtype=float)
+    e = _np.exp(a - a.max())
+    return (100 * e / e.sum()).round().astype(int).tolist()
+
+# 한글 라벨 시각화 (pipe.visualize의 cv2.putText는 한글이 ???로 깨짐 → PIL로 직접 그림)
+_KR_FONT_PATHS = ['/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf',
+                  '/usr/share/fonts/truetype/nanum/NanumGothic.ttf']
+_kr_font_path = next((p for p in _KR_FONT_PATHS if os.path.exists(p)), None)
+if not _kr_font_path:
+    print("⚠️ 나눔폰트 없음(셀 A apt-get 확인) — 라벨을 번호로만 표시")
+
+def visualize_kr(scene_bgr, results):
+    rgb = cv2.cvtColor(scene_bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(pil)
+    fs = max(18, int(pil.width * 0.022))
+    font = ImageFont.truetype(_kr_font_path, fs) if _kr_font_path else ImageFont.load_default()
+    lw = max(3, int(pil.width * 0.003))
+    for i, r in enumerate(results):
+        x, y, w, h = r['bbox']
+        draw.rectangle([x, y, x + w, y + h], outline=(0, 220, 60), width=lw)
+        top1 = r['topk'][0]['name'] if r['topk'] else '?'
+        label = f"#{i} {top1}" if _kr_font_path else f"#{i}"
+        tb = draw.textbbox((0, 0), label, font=font)
+        tw, th = tb[2] - tb[0], tb[3] - tb[1]
+        ty = max(y - th - 8, 2)
+        draw.rectangle([x, ty, x + tw + 8, ty + th + 6], fill=(0, 220, 60))
+        draw.text((x + 4, ty + 2), label, fill=(0, 0, 0), font=font)
+    return np.array(pil)
+
+# _analyze 출력 배열: [0]step1 [1]step2 [2]status1 [3]status2 [4]vis [5]state
+#                     [6..13]pill_rows [14..21]pill_cands [22..29]pill_imgs [30..37]pill_radios
+N_OUT_A = 6 + MAX_PILLS * 4
+_ROW0, _CAND0, _IMG0, _RAD0 = 6, 6 + MAX_PILLS, 6 + MAX_PILLS * 2, 6 + MAX_PILLS * 3
+_CIRC = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧']
+
+def _noop(n):
+    return [gr.update() for _ in range(n)]
+
+def _cand_gallery(info):
+    # 후보 top-3의 실제 알약 사진(식약처 낱알식별) — 일반인이 이름 대신 사진으로 비교
+    if not info.get('topk'):
+        return ''
+    cells = []
+    for n, (sq, nm, p) in enumerate(zip(info['topk'], info['top3_names'], info['pcts'])):
+        u = candidate_image_url(sq)
+        img = (f'<img class="candimg" src="{u}" referrerpolicy="no-referrer">' if u
+               else '<div class="candimg candnoimg">사진<br>없음</div>')
+        cells.append(f'<div class="candcell">{img}'
+                     f'<div class="candnm">{_CIRC[n]} {nm}</div>'
+                     f'<div class="candpct">매칭 {p}%</div></div>')
+    return '<div class="candrow">' + ''.join(cells) + '</div>'
+
+def _analyze(image_path):
+    # 제너레이터: 클릭 즉시 화면 전환 + 진행 문구 → 완료 시 후보 카드 채움
+    base = _noop(N_OUT_A)
+    base[0] = gr.update(visible=False)   # step1 숨김
+    base[1] = gr.update(visible=True)    # step2 표시
+    base[3] = _loading('알약을 찾고 있어요')
+    yield base
+    try:
+        if not image_path:
+            raise ValueError('사진을 먼저 올려 주세요.')
+        bgr, results = run_scene_cached(image_path, k=3)   # 동일 이미지 재실행 시 즉시 반환
+        if not results:
+            back = _noop(N_OUT_A)
+            back[0] = gr.update(visible=True)
+            back[1] = gr.update(visible=False)
+            back[2] = '⚠️ 알약을 찾지 못했어요. 밝은 곳에서 알약이 잘 보이게 다시 찍어 주세요.'
+            yield back
+            return
+        n_total = len(results)
+        if n_total > MAX_PILLS:
+            results = sorted(results, key=lambda r: r['det_conf'], reverse=True)[:MAX_PILLS]
+        out = _noop(N_OUT_A)
+        out[0] = gr.update(visible=False)
+        out[1] = gr.update(visible=True)
+        note = f' (검출 {n_total}개 중 상위 {MAX_PILLS}개만 표시)' if n_total > MAX_PILLS else ''
+        out[3] = (f'### 이 약이 맞나요?\n알약 **{len(results)}개**를 찾았어요{note}. '
+                  'AI 추천 후보를 확인하고, 알약마다 하나씩 선택해 주세요.')
+        out[4] = visualize_kr(bgr, results)
+        st = {'results': []}
+        H, W = bgr.shape[:2]
+        for i in range(MAX_PILLS):
+            if i < len(results):
+                r = results[i]
+                x, y, w, h = r['bbox']
+                pad = int(max(w, h) * 0.2)
+                x0, y0 = max(0, x - pad), max(0, y - pad)
+                x1, y1 = min(W, max(x + w + pad, x0 + 1)), min(H, max(y + h + pad, y0 + 1))
+                _crop = bgr[y0:y1, x0:x1]
+                thumb = cv2.cvtColor(_crop, cv2.COLOR_BGR2RGB) if _crop.size else None
+                thumb_b64 = _b64png(_crop) if _crop.size else ''
+                pcts = _softmax_pct([t['score'] for t in r['topk']]) if r['topk'] else []
+                # 약사 확인 카드·후보 갤러리에 쓸 검출 근거를 state에 저장 (각인 판독값은 사용자 미노출)
+                info = {'topk': [str(t['item_seq']) for t in r['topk']],
+                        'top3_names': [pretty_name(t['item_seq']) for t in r['topk']],
+                        'pcts': pcts, 'ocr': r.get('ocr_raw') or '',
+                        'color': r.get('color', '?'), 'shape': r.get('shape', '?'), 'thumb': thumb_b64}
+                st['results'].append(info)
+                out[_ROW0 + i] = gr.update(visible=True)
+                out[_IMG0 + i] = gr.update(visible=thumb is not None, value=thumb)
+                if r['topk']:
+                    out[_CAND0 + i] = gr.update(visible=True, value=_cand_gallery(info))
+                    choices = [(f"{_CIRC[n]} {nm} · 매칭 {p}%", sq) for n, (nm, sq, p)
+                               in enumerate(zip(info['top3_names'], info['topk'], pcts))]
+                    choices.append(('이 중에 없음 — 약사 확인 필요', 'SKIP'))
+                    out[_RAD0 + i] = gr.update(visible=True, choices=choices, value=info['topk'][0],
+                                               label=f"알약 #{i + 1} · 사진과 비교해 맞는 약을 골라 주세요")
+                else:   # 후보 0건(색·모양 조합에 DB 후보 없음) → 약사 확인만
+                    out[_CAND0 + i] = gr.update(visible=False, value='')
+                    out[_RAD0 + i] = gr.update(visible=True,
+                                               choices=[('후보를 찾지 못했어요 — 약사 확인 필요', 'SKIP')],
+                                               value='SKIP',
+                                               label=f"알약 #{i + 1} · 자동 식별로 후보를 찾지 못했어요")
+            else:
+                out[_ROW0 + i] = gr.update(visible=False)
+                out[_CAND0 + i] = gr.update(visible=False, value='')
+                out[_IMG0 + i] = gr.update(visible=False)
+                out[_RAD0 + i] = gr.update(visible=False, value=None)
+        out[5] = st
+        yield out
+    except ValueError as e:
+        back = _noop(N_OUT_A)
+        back[0] = gr.update(visible=True)
+        back[1] = gr.update(visible=False)
+        back[2] = f'⚠️ {e}'
+        yield back
+    except Exception as e:
+        traceback.print_exc()   # 전체 원인은 Colab 콘솔에 기록
+        back = _noop(N_OUT_A)
+        back[0] = gr.update(visible=True)
+        back[1] = gr.update(visible=False)
+        # 데모 디버깅용: 예외 유형만 노출(경로·키 미포함). 상세는 콘솔 traceback 참조.
+        back[2] = (f'⚠️ 사진 처리 중 문제가 생겼어요 ({type(e).__name__}). '
+                   '다른 사진으로 다시 시도하거나 Colab 콘솔 로그를 확인해 주세요.')
+        yield back
+
+def _generate(state, r0, r1, r2, r3, r4, r5, r6, r7, age, pregnant, inventory_text):
+    # 제너레이터: 상단 전체 안전 체크 → 하단 개별 복약지도서 순서로 생성
+    def stay(msg):
+        return [gr.update(), gr.update(visible=False), msg, gr.update()]
+
+    try:
+        if not state or not state.get('results'):
+            yield stay('⚠️ 먼저 알약 인식을 실행해 주세요.')
+            return
+
+        radio_values = [r0, r1, r2, r3, r4, r5, r6, r7][:len(state['results'])]
+        selected = [v for v in radio_values if v and v != 'SKIP']
+        need_check = [i for i, v in enumerate(radio_values) if v == 'SKIP']
+
+        if not selected and not need_check:
+            yield stay('⚠️ 선택된 약이 없어요. 후보를 1개 이상 선택하거나 약사 확인으로 넘겨 주세요.')
+            return
+
+        parts = []
+
+        if selected:
+            yield stay(_loading('약품 정보를 조회하고 있어요'))
+            cache = {}
+            uniq = list(dict.fromkeys(selected))
+
+            for s in uniq:
+                build_payload_cached(s, cache)
+
+            manual_inventory = resolve_inventory_names(inventory_text, db['dm_valid'])
+            for _nm, s in manual_inventory:
+                build_payload_cached(s, cache)
+
+            meta = {'age': int(age) if age is not None else None, 'pregnant': bool(pregnant)}
+
+            existing_meds = load_active_personal_meds(
+                user_id=PERSONAL_USER_ID,
+                exclude_seqs=uniq,
+            )
+
+            for nm, s in manual_inventory:
+                existing_meds.append({
+                    'item_seq': str(s),
+                    'item_name': nm,
+                    'company_name': None,
+                    'source': 'manual_input',
+                })
+
+            register_result = register_selected_personal_meds(
+                uniq,
+                user_id=PERSONAL_USER_ID,
+            )
+
+            yield stay(_loading('병용금기와 내 복용약 정보를 확인하고 있어요'))
+            parts.append(render_global_safety_report(
+                selected_seqs=uniq,
+                all_payloads=cache,
+                user_meta=meta,
+                existing_meds=existing_meds,
+                register_result=register_result,
+            ))
+
+            for i, seq in enumerate(uniq):
+                yield stay(_loading(f'개별 복약지도서를 쓰고 있어요 ({i + 1}/{len(uniq)})<br>{pretty_name(seq)}', '🧑‍⚕️'))
+                pl, dv = assemble_report_payload(seq, cache, meta)
+                md, _err = generate_report_safe(pl, dv, seq)
+                parts.append(md)
+
+        if need_check:
+            yield stay(_loading('약사 확인이 필요한 약을 정리하고 있어요'))
+            cards = ['# 🔎 약사에게 확인이 필요한 약',
+                     '아래 알약은 **자동 식별로 약을 확정하지 못했습니다**(추천 후보가 실제 약과 달라 모두 거부됨). '
+                     'AI가 임의로 약을 지정해 잘못된 복약 안내를 드리지 않습니다. '
+                     '**아래 정보를 그대로 약사에게 보여주고 확인**하세요.']
+            for i in need_check:
+                info = state['results'][i]
+                rejected = ' / '.join(info.get('top3_names') or []) or '없음'
+                block = [f"### 알약 #{i + 1}"]
+                if info.get('thumb'):
+                    block.append(f"![알약 #{i + 1}]({info['thumb']})")
+                block.append(f"- **검출된 색·모양**: {info.get('color','?')} · {info.get('shape','?')}")
+                block.append(f"- **검토했으나 맞지 않다고 확인한 후보**: {rejected}")
+                block.append("- **상태**: 우리 식별 DB(약 4,500종)에서 일치 항목을 찾지 못함 → 약사 확인 필요")
+                cards.append("\n".join(block))
+            parts.append("\n\n".join(cards))
+
+        parts.insert(0, _report_banner())
+        yield [gr.update(visible=False), gr.update(visible=True), gr.update(),
+               "\n\n---\n\n".join(parts)]
+
+    except Exception:
+        traceback.print_exc()
+        yield stay('⚠️ 지도서 생성 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요.')
+
+with gr.Blocks(title='Pillot — 알약 식별·복약 안내', css=CSS,
+               theme=gr.themes.Soft(primary_hue='indigo', neutral_hue='slate')) as demo:
+    gr.HTML('<div id="hdr"><h1>💊 Pillot</h1>'
+            '<p>사진 한 장으로 알약을 식별하고, 맞춤 복약 안내를 받아 보세요. '
+            '본 안내는 의사·약사 상담을 대체하지 않습니다.</p></div>')
+
+    # ── STEP 1 : 정보 입력 + 촬영 ──
+    with gr.Column(visible=True) as step1:
+        gr.Markdown('<span class="step-tag">STEP 1 · 정보 입력</span>')
+        with gr.Row():
+            age_in = gr.Number(label='나이', value=70, precision=0)
+            preg_in = gr.Checkbox(label='임신 중이거나 가능성 있음')
+        inv_in = gr.Textbox(label='지금 복용 중인 약 (쉼표로 구분, 선택)', placeholder='예: 아스피린, 타이레놀')
+        img_in = gr.Image(type='filepath', label='알약 사진 (여러 알약을 한 번에 찍어도 돼요)')
+        status1 = gr.Markdown()
+        btn_analyze = gr.Button('알약 인식하기 →', variant='primary', size='lg')
+
+    # ── STEP 2 : 후보 확인 (human-in-the-loop) ──
+    with gr.Column(visible=False) as step2:
+        gr.Markdown('<span class="step-tag">STEP 2 · 약 확인</span>')
+        status2 = gr.Markdown()
+        vis_out = gr.Image(label='검출 결과', interactive=False)
+        pill_imgs, pill_radios, pill_rows, pill_cands = [], [], [], []
+        for i in range(MAX_PILLS):
+            with gr.Column(visible=False, elem_classes=['pill-card']) as row:
+                cand = gr.Markdown()   # 후보 top-3 실제 알약 사진 갤러리
+                with gr.Row():
+                    im = gr.Image(interactive=False, show_label=False, show_download_button=False,
+                                  height=110, width=110, elem_classes=['pill-thumb'], scale=0)
+                    rd = gr.Radio(show_label=True, scale=1)
+            pill_rows.append(row); pill_cands.append(cand); pill_imgs.append(im); pill_radios.append(rd)
+        with gr.Row():
+            btn_back1 = gr.Button('← 다시 촬영')
+            btn_gen = gr.Button('복약지도서 만들기 →', variant='primary', size='lg')
+
+    # ── STEP 3 : 복약지도서 ──
+    with gr.Column(visible=False) as step3:
+        gr.Markdown('<span class="step-tag">STEP 3 · 복약 안내</span>')
+        report_out = gr.Markdown()
+        with gr.Row():
+            btn_back2 = gr.Button('← 약 다시 선택')
+            btn_home = gr.Button('처음으로', variant='primary')
+
+    state = gr.State()
+
+    btn_analyze.click(_analyze, [img_in],
+                      [step1, step2, status1, status2, vis_out, state]
+                      + pill_rows + pill_cands + pill_imgs + pill_radios)
+    btn_gen.click(_generate, [state] + pill_radios + [age_in, preg_in, inv_in],
+                  [step2, step3, status2, report_out])
+    btn_back1.click(lambda: (gr.update(visible=True), gr.update(visible=False), ''),
+                    None, [step1, step2, status1])
+    btn_back2.click(lambda: (gr.update(visible=True), gr.update(visible=False)),
+                    None, [step2, step3])
+    btn_home.click(lambda: (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), ''),
+                   None, [step1, step2, step3, status1])
+
+demo.queue().launch(share=True)
+
+"""## 트러블슈팅
+
+| 증상 | 조치 |
+|---|---|
+| OCR 속도·정확도 조절 | 셀 D `OCR_LEVEL` = `fast`(1각도) / `balanced`(4각도, 기본) / `accurate`(12각도) → 셀 E 재실행 |
+| LLM 본문 생성 실패 | Colab 콘솔의 `[Solar 재시도]` 로그·traceback 확인 (키/모델명/네트워크). 실패해도 허가원문 기반 본문으로 자동 폴백 |
+| 공개 URL 안 뜸 / 끊김 | 셀 I 재실행 (share 터널 재발급) |
+| `SecretNotFoundError` | 왼쪽 🔑에서 시크릿 등록 + **노트북 접근 토글 ON** |
+| DB 연결 실패 (셀 F) | `DB_HOST`, `DB_PORT`, 계정 정보, 방화벽/allowlist 확인 |
+| paddle/numpy 오류 | 셀 A 재실행 후 **런타임 재시작** 누락 여부 확인 |
+| 검출 0건 | 밝은 배경·초점 확인. 셀 H가 자동으로 det_conf 0.15 완화 재시도 |
+
+- 데모 후 보안: Upstage API 키 로테이션 권장 (Solar 콘솔), DB는 프로젝트 종료 시 폐기 예정.
+
+"""
