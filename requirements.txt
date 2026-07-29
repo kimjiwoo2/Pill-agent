@@ -1,0 +1,35 @@
+# PILLAR — 전체 파이프라인 의존성
+# 설치: pip install -r requirements.txt
+# Colab 기준. torch/numpy/pandas 등은 Colab에 기본 제공되지만 재현을 위해 명시.
+
+# ── 공통 ──
+numpy
+pandas
+Pillow
+opencv-python-headless          # headless: 서버에서 libGL 없이 동작
+
+# ── Detection (YOLO) — final/detection ──
+ultralytics>=8.3
+matplotlib
+
+# ── Classification (색·모양 2-head) — final/classification ──
+torch
+torchvision
+scikit-learn
+
+# ── OCR (각인 인식) — final/ocr ──
+paddleocr
+paddlepaddle                    # GPU 환경은 paddlepaddle-gpu 사용
+
+# ── Matching / Fusion — final/matching ──
+scipy                           # 조건부 로짓 최적화(L-BFGS)
+
+# ── DB (DUR·drug_master) ──
+sqlalchemy
+pymysql
+
+# ── RAG / 리포트 생성 ──
+openai                          # Upstage Solar (OpenAI 호환 API)
+
+# ── 웹 데모 ──
+gradio>=4.44,<6

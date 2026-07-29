@@ -233,3 +233,11 @@ data/
 .env 
 __pycache__/ 
 *.pyc
+.DS_Store
+
+# ── 레포 정리 (2026-07): 데이터·자산은 Drive 보관, git 금지 ──
+fusion_test/
+Pillot
+**/.DS_Store
+**/__pycache__/
+*.pyc
