@@ -3,7 +3,7 @@
 GT = drug_master에 등록된 그 item_seq의 색/모양, Pred = 분류기 argmax.
 ※ Temperature Scaling은 argmax를 바꾸지 않으므로 정확도엔 무관(있어도 무방).
 
-pill_fusion.py 와 같은 폴더(src/matching/)에 두고 동일 인자로 실행.
+pill_fusion.py 와 같은 폴더(final/matching/)에 두고 동일 인자로 실행.
 
 사용 (test):
   python cls_head_accuracy.py --split test \

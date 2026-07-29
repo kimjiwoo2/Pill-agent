@@ -39,13 +39,14 @@ PILLAR는 스마트폰으로 알약 사진을 촬영하면 AI가 약물을 식�
 ## 저장소 구조
 
 ```
-final/                  # 최종 코드
+final/
 ├── detection/          # YOLO 검출 학습
 ├── classification/     # 색·모양 2-head 분류기 학습
 ├── ocr/                # 각인 인식 파이프라인
 ├── matching/           # 융합·랭킹·E2E 오케스트레이션
-└── demo/               # 웹 데모 (Colab + Gradio)  ※ 커밋 예정
-notebooks/              # 실험·학습 노트북 (출력 제거본)
+├── llm/                # DUR 페이로드 구축·복약지도서 생성
+├── demo/               # 웹 데모 (Colab + Gradio)
+└── .env.example        # 필요한 시크릿 이름
 ```
 
 데이터·모델 가중치·데모 자산은 **git에 포함하지 않으며 Google Drive에 보관**한다.
@@ -101,8 +102,8 @@ Colab에서 Drive를 mount한 뒤, 아래 파일이 지정 경로에 있어야 �
 ## 실행 방법
 
 ### 웹 데모 (End-to-End)
-Colab에서 `final/demo/`의 데모 노트북을 열고(런타임: T4 GPU) 셀 순서대로 실행한다.
-설치 → 시크릿 → 자산 검증 → 모델 로드 → 데모 기동.
+`final/demo/web_demo_final.py` — Colab(T4 GPU)에서 셀 순서대로 실행한다.
+설치 → 시크릿 → 자산 검증 → 모델 로드 → Gradio 데모 기동.
 
 ### YOLO 검출 학습 — `final/detection/yolo_detect_train.py`
 1-class 축정렬 bbox YOLOv11n 학습.
